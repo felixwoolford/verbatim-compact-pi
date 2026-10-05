@@ -53,9 +53,7 @@ so only one copy loads.
 From the checkout directory:
 
 ```bash
-mkdir -p ~/.pi/agent/extensions ~/.pi/agent/skills
-cp verbatim-compact.ts ~/.pi/agent/extensions/
-cp -r context-retrieval ~/.pi/agent/skills/
+cp -r source/* ~/.pi/agent/
 ```
 
 Then `/reload`. Project equivalents are `.pi/extensions/` and `.pi/skills/`.
