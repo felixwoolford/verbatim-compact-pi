@@ -169,10 +169,10 @@ sessions, and three successive compactions:
 
 | | After compaction 1 | After compaction 2 | After compaction 3 |
 |---|---:|---:|---:|
-| Pi model-summary recall | 83% | 79% | 79% |
+| Pi default compaction recall | 83% | 79% | 79% |
 | verbatim-compact recall | 97% | 99% | 99% |
-| Pi confident wrong answers | 6 | 13 | 14 |
-| verbatim-compact confident wrong answers | 0 | 1 | 0 |
+| Pi default compaction confidently wrong answers | 6 | 13 | 14 |
+| verbatim-compact confidently wrong answers | 0 | 1 | 0 |
 
 Median compaction time was **0.8–1.1 seconds** for verbatim-compact and
 **204–372 seconds** for Pi's model summary. These timings exclude lookups,
