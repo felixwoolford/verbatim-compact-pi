@@ -1,0 +1,49 @@
+{
+  "name": "verbatim-compact",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic, verbatim-preserving compaction for Pi, with transcript dumps and subagent context recovery.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compaction",
+    "context-recovery"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "verbatim-compact.ts",
+    "context-retrieval/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs/"
+  ],
+  "pi": {
+    "extensions": ["./verbatim-compact.ts"],
+    "skills": ["./context-retrieval"]
+  },
+  "scripts": {
+    "test": "node scripts/test-all.cjs",
+    "test:integration": "node test.cjs",
+    "test:cap": "node test.cjs cap",
+    "test:caphang": "node test.cjs caphang",
+    "test:capspans": "node test.cjs capspans",
+    "test:dumpdir": "node test.cjs dumpdir",
+    "test:nowarn": "node test.cjs nowarn",
+    "test:package": "node scripts/test-package.cjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.3"
+  }
+}

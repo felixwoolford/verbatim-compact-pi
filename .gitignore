@@ -1,0 +1,20 @@
+# Context dumps can contain credentials, private code, and conversation history.
+.pi/context-dumps/
+**/.pi/context-dumps/
+
+# Dependencies and generated artifacts
+node_modules/
+*.tgz
+coverage/
+*.log
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
