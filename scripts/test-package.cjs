@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { execFileSync } = require("node:child_process");
 const { piRoot } = require("./pi-runtime.cjs");
 const root = path.resolve(__dirname, "..");
 
@@ -13,9 +14,22 @@ async function main() {
   assert.equal(manifest.private, true, "GitHub-only staging must not publish accidentally");
   assert.equal(manifest.license, "MIT");
   assert(manifest.keywords.includes("pi-package"));
-  assert.deepEqual(manifest.pi.extensions, ["./verbatim-compact.ts"]);
-  assert.deepEqual(manifest.pi.skills, ["./context-retrieval"]);
+  assert.deepEqual(manifest.pi.extensions, ["./source/extensions/verbatim-compact.ts"]);
+  assert.deepEqual(manifest.pi.skills, ["./source/skills/context-retrieval"]);
   assert(!manifest.dependencies, "host-provided runtime packages must not be bundled");
+
+  const packResult = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 30_000,
+    shell: process.platform === "win32",
+  }));
+  // npm 12 keys results by package name; earlier versions return an array.
+  const [packed] = Array.isArray(packResult) ? packResult : Object.values(packResult);
+  const packedPaths = new Set(packed.files.map((file) => file.path));
+  for (const resource of ["source/extensions/verbatim-compact.ts", "source/skills/context-retrieval/SKILL.md"]) {
+    assert(packedPaths.has(resource), `npm package includes ${resource}`);
+  }
 
   const { DefaultPackageManager } = await import(pathToFileURL(path.join(piRoot, "dist/core/package-manager.js")).href);
   const { SettingsManager } = await import(pathToFileURL(path.join(piRoot, "dist/core/settings-manager.js")).href);
@@ -28,7 +42,7 @@ async function main() {
     const resources = await manager.resolveExtensionSources([root], { temporary: true });
     const extensionPaths = resources.extensions.filter((r) => r.enabled).map((r) => r.path);
     const skillPaths = resources.skills.filter((r) => r.enabled).map((r) => r.path);
-    assert.deepEqual(extensionPaths, [path.join(root, "verbatim-compact.ts")], "Pi discovers exactly the intended extension");
+    assert.deepEqual(extensionPaths, [path.join(root, "source", "extensions", "verbatim-compact.ts")], "Pi discovers exactly the intended extension");
     assert.equal(skillPaths.length, 1, "Pi discovers the bundled skill");
     const loaded = await loadExtensions(extensionPaths, root);
     assert.deepEqual(loaded.errors, [], "real Pi extension loader reports no errors");
@@ -41,7 +55,7 @@ async function main() {
     assert.equal(skills.skills.length, 1);
     assert.equal(skills.skills[0].name, "context-retrieval");
     assert.deepEqual(skills.diagnostics, []);
-    console.log("PACKAGE TEST OK — manifest, real Pi loader, tools, command, and bundled skill");
+    console.log("PACKAGE TEST OK — manifest, packed resources, real Pi loader, tools, command, and bundled skill");
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }

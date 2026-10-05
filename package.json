@@ -15,8 +15,8 @@
     "node": ">=22.19.0"
   },
   "files": [
-    "verbatim-compact.ts",
-    "context-retrieval/",
+    "source/extensions/verbatim-compact.ts",
+    "source/skills/context-retrieval/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -24,8 +24,8 @@
     "docs/"
   ],
   "pi": {
-    "extensions": ["./verbatim-compact.ts"],
-    "skills": ["./context-retrieval"]
+    "extensions": ["./source/extensions/verbatim-compact.ts"],
+    "skills": ["./source/skills/context-retrieval"]
   },
   "scripts": {
     "test": "node scripts/test-all.cjs",

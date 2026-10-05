@@ -39,7 +39,7 @@ const { piRoot, jitiAliases } = require("./scripts/pi-runtime.cjs");
 const { createJiti } = require(require.resolve("jiti", { paths: [piRoot] }));
 const jiti = createJiti(__filename, { alias: jitiAliases });
 
-const EXT_PATH = path.join(__dirname, "verbatim-compact.ts");
+const EXT_PATH = path.join(__dirname, "source", "extensions", "verbatim-compact.ts");
 
 function loadExt() {
   const handlers = {};

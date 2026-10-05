@@ -36,8 +36,9 @@ The test helper also checks local dependencies and global npm installations.
 - `MECH_COMPACT_DUMP_DIR` redirection test (dump written outside the project,
   lookup resolves it), run as its own process because the override is read at
   module load.
-- A package smoke test using Pi's real package resolver, extension loader, and
-  skill loader.
+- A package smoke test checking that `npm pack --dry-run` includes the extension
+  and skill, then using Pi's real package resolver, extension loader, and skill
+  loader.
 
 No model calls, credentials, or GPU are needed. Test data is synthetic, and dumps
 are written under the operating system's temporary directory. Some integration
