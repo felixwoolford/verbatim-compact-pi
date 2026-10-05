@@ -1,9 +1,13 @@
 # verbatim-compact
 
 Deterministic context compaction for [Pi](https://pi.dev/). Replaces the
-model-generated compaction summary with a checkpoint built from conversation
+model-generated compaction summary with a checkpoint built from verbatim conversation
 text. Thinking and tool outputs are removed from active context but preserved
 in local transcript dumps, with a subagent tool for recovery.
+
+A re-orientation block is appended to the compacted checkpoint ensuring that the agent is aware that the entire session history is either present in the context verbatim, or completely stripped.
+
+Testing indicates that this helps a local lLM-tier model avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The intended use case is local inference: for example, **Qwen 3.8 27B through
 llama.cpp on an RTX 5090**. Compaction itself makes no model call. Recovery uses
