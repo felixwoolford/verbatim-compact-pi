@@ -164,14 +164,14 @@ Selecting a remote lookup model sends those excerpts to its provider.
 
 ## Pilot results
 
-A synthetic debugging pilot used local **Qwen3.8-27B via llama.cpp**, ten
+A synthetic pilot used local **Qwen3.8-27B via llama.cpp**, ten
 sessions, and three successive compactions:
 
 | | After compaction 1 | After compaction 2 | After compaction 3 |
 |---|---:|---:|---:|
 | Pi default compaction recall | 83% | 79% | 79% |
-| verbatim-compact recall | 97% | 99% | 99% |
 | Pi default compaction confidently wrong answers | 6 | 13 | 14 |
+| verbatim-compact recall | 97% | 99% | 99% |
 | verbatim-compact confidently wrong answers | 0 | 1 | 0 |
 
 Median compaction time was **0.8–1.1 seconds** for verbatim-compact and
