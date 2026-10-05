@@ -9,9 +9,11 @@ A re-orientation block is appended to the compacted checkpoint ensuring that the
 
 Testing indicates that this helps a local lLM-tier model avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
-The intended use case is local inference: for example, **Qwen 3.8 27B through
+The primary intended use case is local inference: for example, **Qwen 3.8 27B through
 llama.cpp on an RTX 5090**. Compaction itself makes no model call. Recovery uses
 the session model by default and does not require a second model to be loaded.
+Performance improvements over compaction are greatest in this case, but the tool is also effective with frontier models.
+Performance benchmarking with frontier models is WIP.
 
 ## Install
 
