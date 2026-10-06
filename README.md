@@ -89,9 +89,7 @@ To compact manually:
 /compaction-method verbatim
 /compaction-method summary
 ```
-
-Verbatim-compact is default so long as the extension is installed.
-/compaction-method is available to opt-in to Pi's builtin summary compaction for the current session.
+`/compaction-method` is available to opt-in to Pi's builtin summary compaction for the current session.
 
 With no argument, the command reports the current method. A summary-mode warning
 appears when actually switching to summary, but not on repeated selections,
