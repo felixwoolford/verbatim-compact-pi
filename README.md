@@ -37,10 +37,10 @@ This installs both the extension and the `context-retrieval` skill. Run `/reload
 in an existing Pi session, or restart Pi.
 
 Once the GitHub repository and release tag exist, install directly with the
-following command, replacing `OWNER` and the tag:
+following command:
 
 ```bash
-pi install git:github.com/OWNER/verbatim-compact@v0.1.0
+pi install git:github.com/felixwoolford/verbatim-compact
 ```
 
 Use `pi install --local <source>` for a project-only installation. To load a
@@ -62,7 +62,6 @@ cp -r source/* ~/.pi/agent/
 ```
 
 Then `/reload`. Project equivalents are `.pi/extensions/` and `.pi/skills/`.
-There is no extension-created dump directory to add to `.gitignore`.
 
 ## Usage
 
@@ -72,9 +71,6 @@ To compact manually:
 ```text
 /compact
 ```
-
-This works even if Pi's automatic compaction is disabled. No snapshot is needed
-before long work: Pi already retains finalized entries in its session history.
 
 The extension registers one model-callable tool:
 
