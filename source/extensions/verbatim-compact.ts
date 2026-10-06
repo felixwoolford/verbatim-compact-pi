@@ -838,7 +838,7 @@ export default function (pi: ExtensionAPI) {
       const method = requested || previous;
       const changed = method !== previous;
       if (changed) pi.appendEntry(METHOD_ENTRY, { method });
-      ctx.ui.notify(`Compaction method: ${method} (manual, automatic, and overflow recovery). Auto-compaction on/off is unchanged.`, "info");
+      ctx.ui.notify(`Compaction method: ${method} (manual, automatic, and overflow recovery).`, "info");
       if (changed && method === "default") ctx.ui.notify(DEFAULT_COMPACTION_WARNING, "warning");
       else if (changed && collectBaseAndSpans(entries).base?.kind === "model-summary") ctx.ui.notify(MIXED_CONTEXT_WARNING, "warning");
     },
