@@ -103,6 +103,49 @@ Retained prose records what was said, not verification of its claims. Historical
 tool output is evidence of past state, not necessarily current source or test
 state. Recovered thinking is reasoning-at-the-time, not verified fact.
 
+## Configuration
+
+No separate configuration file is required. Set environment variables before
+starting Pi:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MECH_COMPACT_MAX_SUMMARY_CHARS` | `80000` | Conversation-section character budget. |
+| `MECH_COMPACT_LOOKUP_MODEL` | Session model | Optional `provider/modelId` for lookups; must support tool calls and be available in Pi. An unresolved model falls back to the session model. |
+| `MECH_COMPACT_LOOKUP_TURNS` | `10` | Maximum search turns; exhaustion adds one final tool-free write-up call. |
+| `MECH_COMPACT_LOOKUP_SESSION_FILE` | Unset | Optional absolute path to a full session JSONL, replacing the current branch as the lookup source. Intended for harnesses using pruned forks. |
+
+For a smaller checkpoint:
+
+```bash
+MECH_COMPACT_MAX_SUMMARY_CHARS=40000 pi
+```
+
+The model, turn budget, and size guard are read when the extension loads. The
+session-file override is checked at each lookup. Restart Pi after changing its
+launching environment; `/reload` does not change inherited environment variables.
+The extension does not automatically load `.env` files.
+
+Leave the session-file override unset for ordinary use. When configured, lookup
+opens that file with `SessionManager.open()` and renders its branch. Relative,
+missing, empty, or invalid source files fail explicitly rather than silently
+searching the pruned fork. Opening a legacy file may trigger Pi's normal session
+migration. The override is extension configuration, not a tool argument or a
+filesystem search route for the main agent.
+
+The character budget is not a token limit or a hard cap on the whole checkpoint.
+Instructions and file lists sit outside the conversation section; an inherited
+base is uncapped and the line budget has a 500-character minimum. Tune it
+alongside the model's context window and Pi's `compaction.keepRecentTokens`.
+[Design details](docs/design.md).
+
+### Local inference engines
+
+When lookups use the session model on a local server, they share its KV cache with the main session.
+
+- **llama.cpp**: on a single-slot server (`-np 1`), each lookup call evicts the main session's KV cache. Enable host-memory prompt caching with `--cache-ram <MiB>`, sized to hold at least one full main-session state, so the main session resumes in seconds instead of re-processing its entire context.
+- **Other engines**: make sure the main session's prefix survives lookup calls, via prefix caching (on by default in vLLM and SGLang), host-RAM KV offloading where available, or enough parallel capacity to keep both sessions resident. Engines without these will re-prefill the main session after every lookup.
+
 ## How it works
 
 ### Deterministic checkpoint
@@ -197,48 +240,7 @@ current session-backed implementation. They have not been re-measured for this
 release and are not a general performance guarantee. A fuller evaluation is in
 progress. [Details, examples, and scoring notes](docs/pilot-results.md).
 
-## Configuration
 
-No separate configuration file is required. Set environment variables before
-starting Pi:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MECH_COMPACT_MAX_SUMMARY_CHARS` | `80000` | Conversation-section character budget. |
-| `MECH_COMPACT_LOOKUP_MODEL` | Session model | Optional `provider/modelId` for lookups; must support tool calls and be available in Pi. An unresolved model falls back to the session model. |
-| `MECH_COMPACT_LOOKUP_TURNS` | `10` | Maximum search turns; exhaustion adds one final tool-free write-up call. |
-| `MECH_COMPACT_LOOKUP_SESSION_FILE` | Unset | Optional absolute path to a full session JSONL, replacing the current branch as the lookup source. Intended for harnesses using pruned forks. |
-
-For a smaller checkpoint:
-
-```bash
-MECH_COMPACT_MAX_SUMMARY_CHARS=40000 pi
-```
-
-The model, turn budget, and size guard are read when the extension loads. The
-session-file override is checked at each lookup. Restart Pi after changing its
-launching environment; `/reload` does not change inherited environment variables.
-The extension does not automatically load `.env` files.
-
-Leave the session-file override unset for ordinary use. When configured, lookup
-opens that file with `SessionManager.open()` and renders its branch. Relative,
-missing, empty, or invalid source files fail explicitly rather than silently
-searching the pruned fork. Opening a legacy file may trigger Pi's normal session
-migration. The override is extension configuration, not a tool argument or a
-filesystem search route for the main agent.
-
-The character budget is not a token limit or a hard cap on the whole checkpoint.
-Instructions and file lists sit outside the conversation section; an inherited
-base is uncapped and the line budget has a 500-character minimum. Tune it
-alongside the model's context window and Pi's `compaction.keepRecentTokens`.
-[Design details](docs/design.md).
-
-### Local inference engines
-
-When lookups use the session model on a local server, they share its KV cache with the main session.
-
-- **llama.cpp**: on a single-slot server (`-np 1`), each lookup call evicts the main session's KV cache. Enable host-memory prompt caching with `--cache-ram <MiB>`, sized to hold at least one full main-session state, so the main session resumes in seconds instead of re-processing its entire context.
-- **Other engines**: make sure the main session's prefix survives lookup calls, via prefix caching (on by default in vLLM and SGLang), host-RAM KV offloading where available, or enough parallel capacity to keep both sessions resident. Engines without these will re-prefill the main session after every lookup.
 
 ## Limitations and safety
 
