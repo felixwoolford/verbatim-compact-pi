@@ -12,7 +12,7 @@ full raw branch and returns only relevant findings.
 The defining property of verbatim-compact is the guarantee that all history is either kept
 verbatim in context or stripped entirely from it; nothing is ever compressed in
 between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and that the remaining information must be verified before being relied on.
-Tests indicate that this helps consumer-hardware-tier models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
+Tests indicate that this helps weaker models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The primary intended use case is on a strong local LLM with a reasonably large context window (128k+) : for example, **Qwen 3.8 27B through
 llama.cpp on an RTX 5090**. Recovery uses
