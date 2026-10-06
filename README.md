@@ -9,7 +9,7 @@ Compaction itself makes no model call and creates no transcript dump. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
-Testing indicates that this helps a local lLM-tier model avoid confabulating the historical context and to more carefully verify what it does and does not know.
+Tests indicate that this helps local LLM-tier models avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The primary intended use case is local inference: for example, **Qwen 3.8 27B through
 llama.cpp on an RTX 5090**. Compaction itself makes no model call. Recovery uses
