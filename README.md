@@ -3,7 +3,7 @@
 Deterministic context compaction for [Pi](https://pi.dev/), with session-backed
 recovery. Replaces Pi's model-generated compaction summary with a checkpoint
 built mechanically from conversation text. Thinking and tool outputs are removed
-from the active model context, **not from the session history**.
+from the active model context, while user inputs, assistant text, and tool call stubs are retained verbatim.
 
 Compaction itself makes no model call. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
@@ -88,19 +88,7 @@ It can call `context_lookup` with:
 ```
 
 The subagent searches in its own context and returns findings with entry
-references. Raw search results stay out of the main conversation. Do not grep or
-read session files directly for recovery; that would refill the compacted context.
-
-Use one narrowly scoped information need per lookup. Recover independent missing
-facts separately, then integrate the findings in the main conversation. The
-bundled skill explains this workflow. To load it explicitly:
-
-```text
-/skill:context-retrieval
-```
-
-Lookup covers **all compactions on the current branch**, not abandoned branches
-or unrelated sessions. Forks can recover history copied into their own branch.
+references. Raw search results stay out of the main conversation. 
 
 After compaction, the checkpoint instructs the agent to re-run project startup
 checks, inspect Git state, and re-read files before modifying them. Historical
@@ -108,8 +96,6 @@ tool output is evidence of past state, not necessarily current source or test
 state. Recovered thinking is reasoning-at-the-time, not verified fact.
 
 ## How it works
-
-
 
 ### Deterministic checkpoint
 
@@ -239,15 +225,6 @@ base is uncapped and the line budget has a 500-character minimum. Tune it
 alongside the model's context window and Pi's `compaction.keepRecentTokens`.
 [Design details](docs/design.md).
 
-## Updating from a dump-based installation
-
-- Replace the extension and bundled skill together, then `/reload` or restart Pi.
-- `dump_context`, `/dump-context`, and the `dumpDir` lookup argument are removed.
-  Pi's `/export` can create an independent export when needed.
-- `MECH_COMPACT_DUMP_DIR` and `MECH_COMPACT_WARN_GITIGNORE` are no longer used.
-- Existing dumps are neither read nor deleted. Review/remove them manually if
-  appropriate; keep ignore rules while sensitive old files remain in a project.
-- Retained session history, not old dump directories, is the recovery source.
 
 ## Limitations and safety
 
