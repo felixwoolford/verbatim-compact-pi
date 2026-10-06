@@ -1,37 +1,31 @@
 /**
-* verbatim-compact — deterministic, verbatim-preserving compaction for pi.
-*
-* Replaces pi's model-generated compaction summary with a checkpoint built
-* mechanically from the dropped messages (thinking and tool outputs removed),
-* after dumping the full branch to .pi/context-dumps/. Dropped details are
-* recovered via the context_lookup subagent.
-*
-* Dumps are scoped to the session by entry-id overlap: a dump belongs to the
-* current session when its meta.json index contains the current branch's
-* first entry id (pre-index dumps fall back to the meta.json sessionFile).
-* After each dump write, older dumps of this session that are provably
-* contained in the new one (every indexed entry id present in it) are pruned.
-*
-* See README.md for the checkpoint format, install, settings and design notes.
-*
-* Optional env settings:
-*   MECH_COMPACT_MAX_SUMMARY_CHARS  size guard for the checkpoint (default 80000)
-*   MECH_COMPACT_LOOKUP_MODEL       "provider/modelId" for the lookup subagent
-*   MECH_COMPACT_LOOKUP_TURNS       max search turns (default 10), plus one final
-*                                  write-up call if the search budget is exhausted
-*   MECH_COMPACT_DUMP_DIR           absolute path that replaces <project>/.pi/context-dumps
-*                                  (relative values are ignored with a warning)
-*   MECH_COMPACT_WARN_GITIGNORE     warn when dumps land in a git repo that doesn't
-*                                  ignore them (default on; 0/false/no/off disables)
-*/
+ * verbatim-compact — verbatim compaction with session-backed recovery.
+ *
+ * Builds a deterministic checkpoint without writing local transcript dumps. context_lookup renders the current raw
+ * session branch in memory at call time, including earlier compactions,
+ * thinking, full tool outputs, and tool-call arguments. Pi normally persists
+ * this history under ~/.pi/agent/sessions/; custom session locations and
+ * ephemeral sessions work too. Only the active branch is searched.
+ *
+ * Does not register dump_context or /dump-context, and does not read, write,
+ * or prune old dumps.
+ *
+ * Optional env settings:
+ *   MECH_COMPACT_MAX_SUMMARY_CHARS    conversation-section guard (default 80000)
+ *   MECH_COMPACT_LOOKUP_MODEL         "provider/modelId" for the lookup subagent
+ *   MECH_COMPACT_LOOKUP_TURNS         max search turns (default 10), plus one
+ *                                    final write-up when the budget is exhausted
+ *   MECH_COMPACT_LOOKUP_SESSION_FILE  absolute session JSONL path to search
+ *                                    instead of the current branch (study override)
+ */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
 import { Type } from "typebox";
 import { contentText, normalizeContext, uuidv7 } from "@earendil-works/pi-ai";
 import type { Message as AiMessage, Model, Tool as AiTool } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ModelRegistry, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
@@ -39,21 +33,12 @@ import type { ExtensionAPI, ModelRegistry, SessionEntry } from "@earendil-works/
 // ============================================================================
 
 const MECH_KIND = "mech-compact";
-const DUMP_ROOT_PARTS = [".pi", "context-dumps"] as const;
 
 function intFromEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
-function boolFromEnv(name: string, fallback: boolean): boolean {
-  const raw = process.env[name]?.trim().toLowerCase();
-  if (raw === undefined || raw === "") return fallback;
-  if (["0", "false", "no", "off"].includes(raw)) return false;
-  if (["1", "true", "yes", "on"].includes(raw)) return true;
-  return fallback;
 }
 
 const cfg = {
@@ -64,18 +49,7 @@ const cfg = {
   grepMaxChars: 12_000,
   showEntryMaxChars: 24_000,
   lookupAnswerMaxChars: 12_000,
-  warnGitIgnore: boolFromEnv("MECH_COMPACT_WARN_GITIGNORE", true),
 };
-
-// Optional absolute-path override for the dump root (MECH_COMPACT_DUMP_DIR).
-// Relative values are rejected: they would resolve against the wrong base
-// depending on which process cwd reads them.
-const dumpDirOverrideRaw = process.env.MECH_COMPACT_DUMP_DIR?.trim() || undefined;
-const dumpDirOverride = dumpDirOverrideRaw && path.isAbsolute(dumpDirOverrideRaw) ? dumpDirOverrideRaw : undefined;
-if (dumpDirOverrideRaw && !dumpDirOverride)
-  console.warn(
-    `verbatim-compact: MECH_COMPACT_DUMP_DIR must be an absolute path; ignoring "${dumpDirOverrideRaw}" and using <project>/.pi/context-dumps`,
-  );
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -99,7 +73,7 @@ function textOf(content: unknown): TextOut {
       if (block && block.type === "text" && typeof block.text === "string") text += block.text;
       else if (block && block.type === "image") images++;
     }
-    if (images > 0) text += `\n[${images} image(s) attached — binary, not inlined in dumps]`;
+    if (images > 0) text += `\n[${images} image(s) attached — binary, not inlined in transcript]`;
     return { text, images };
   }
   return { text: "", images: 0 };
@@ -112,7 +86,7 @@ function truncateMiddle(text: string, max: number): string {
 }
 
 // ============================================================================
-// Dump: full-fidelity branch serialization (untruncated, entry-anchored)
+// Transcript: full-fidelity branch serialization (untruncated, entry-anchored)
 // ============================================================================
 
 const HR = "=".repeat(78);
@@ -162,13 +136,13 @@ function serializeAgentMessage(msg: AgentMessage): { lines: string[]; sections?:
   return sections.length > 0 ? { lines, sections } : { lines };
 }
 
-interface DumpIndexSection {
+interface TranscriptIndexSection {
   kind: string;
   /** 1-based line number of the section marker line */
   startLine: number;
 }
 
-interface DumpIndexEntry {
+interface TranscriptIndexEntry {
   id: string;
   type: string;
   role?: string;
@@ -176,12 +150,12 @@ interface DumpIndexEntry {
   startLine: number;
   /** 1-based line number of the last line of the block (inclusive) */
   endLine: number;
-  sections?: DumpIndexSection[];
+  sections?: TranscriptIndexSection[];
 }
 
-function branchToDump(entries: SessionEntry[]): { lines: string[]; index: DumpIndexEntry[] } {
+function branchToTranscript(entries: SessionEntry[]): { lines: string[]; index: TranscriptIndexEntry[] } {
   const lines: string[] = [
-    "# pi context dump — full pre-compaction branch",
+    "# pi session transcript — full raw branch",
     "# Each block starts with an ENTRY header; entry ids match the session JSONL.",
     "# Thinking blocks and tool outputs are complete (not truncated).",
     "",
@@ -278,8 +252,8 @@ function branchToDump(entries: SessionEntry[]): { lines: string[]; index: DumpIn
     lines.push("");
     blocks.push({ id: entry.id, type: entry.type, role, hrIdx, sections });
   }
-  const index: DumpIndexEntry[] = blocks.map((b, i) => {
-    const e: DumpIndexEntry = {
+  const index: TranscriptIndexEntry[] = blocks.map((b, i) => {
+    const e: TranscriptIndexEntry = {
       id: b.id,
       type: b.type,
       startLine: b.hrIdx + 2, // header line (1-based)
@@ -290,99 +264,6 @@ function branchToDump(entries: SessionEntry[]): { lines: string[]; index: DumpIn
     return e;
   });
   return { lines, index };
-}
-
-interface DumpInfo {
-  dir: string;
-  conversationPath: string;
-  metaPath: string;
-  chars: number;
-}
-
-function writeDump(opts: {
-  entries: SessionEntry[];
-  cwd: string;
-  sessionFile: string | null;
-  reason: string;
-  tokensBefore?: number;
-  firstKeptEntryId?: string;
-}): DumpInfo {
-  const now = new Date();
-  const stamp = now.toISOString().replace(/\.\d+Z$/, "").replace(/:/g, "-");
-  // 8 chars of real randomness (the timestamp in `stamp` already orders dumps;
-  // the suffix exists so two dumps in the same second never overwrite each other)
-  const suffix = Math.random().toString(36).slice(2, 10);
-  const dir = path.join(dumpRoot(opts.cwd), `${stamp}_${suffix}`);
-  fs.mkdirSync(dir, { recursive: true });
-
-  const { lines, index } = branchToDump(opts.entries);
-  const conversation = lines.join("\n");
-  const meta = {
-    kind: "pi-context-dump",
-    timestamp: now.toISOString(),
-    reason: opts.reason,
-    cwd: opts.cwd,
-    sessionFile: opts.sessionFile,
-    tokensBefore: opts.tokensBefore ?? null,
-    firstKeptEntryId: opts.firstKeptEntryId ?? null,
-    entries: opts.entries.length,
-    chars: conversation.length,
-    index,
-  };
-  const conversationPath = path.join(dir, "conversation.md");
-  const metaPath = path.join(dir, "meta.json");
-  fs.writeFileSync(conversationPath, conversation, "utf8");
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
-  return { dir, conversationPath, metaPath, chars: conversation.length };
-}
-
-function safeSessionFile(ctx: { sessionManager?: { getSessionFile?: () => string | null } }): string | null {
-  try {
-    return ctx.sessionManager?.getSessionFile?.() ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// Dumps can contain credentials, private code, and conversation history. Warn
-// once per process per dump root when dumps land inside a git worktree whose
-// ignore rules do not cover them. An explicit override pointing outside the
-// project is the user's deliberate choice and is not warned about.
-const gitWarnedRoots = new Set<string>();
-function warnIfDumpsNotIgnored(cwd: string, notify?: (msg: string, level: "info" | "warning" | "error") => void): void {
-  if (!notify || !cfg.warnGitIgnore) return;
-  const cwdAbs = path.resolve(cwd);
-  const rootAbs = path.resolve(dumpRoot(cwd));
-  if (gitWarnedRoots.has(rootAbs)) return;
-  if (!rootAbs.startsWith(cwdAbs + path.sep) && rootAbs !== cwdAbs) return;
-  try {
-    const inside = execFileSync("git", ["-C", cwdAbs, "rev-parse", "--is-inside-work-tree"], {
-      encoding: "utf8",
-      timeout: 3_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (inside !== "true") return;
-    gitWarnedRoots.add(rootAbs);
-    const rel = path.relative(cwdAbs, rootAbs);
-    let notIgnored = false;
-    try {
-      execFileSync("git", ["-C", cwdAbs, "check-ignore", "-q", "--", rel], {
-        encoding: "utf8",
-        timeout: 3_000,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-    } catch (e) {
-      // exit 1 = not ignored; any other non-zero code is an error — don't warn on errors.
-      notIgnored = (e as { status?: number }).status === 1;
-    }
-    if (notIgnored)
-      notify(
-        `verbatim-compact: dumps under ${rel} are not git-ignored in this repository and can contain credentials, private code, and conversation history — add ${rel}/ to .gitignore, or set MECH_COMPACT_DUMP_DIR to keep dumps outside the project`,
-        "warning",
-      );
-  } catch {
-    // git unavailable or not a repository: nothing to warn about.
-  }
 }
 
 // ============================================================================
@@ -420,17 +301,17 @@ function summarizeMessages(messages: AgentMessage[]): string[] {
         for (const block of m.content ?? []) {
           if (block.type === "text") prose += (prose ? "\n" : "") + String(block.text ?? "");
           else if (block.type === "toolCall") calls.push(toolCallSignature(String(block.name), block.arguments));
-          // thinking blocks: removed by design (kept in the dump)
+          // thinking blocks: removed by design (kept in the session)
         }
         if (prose.trim()) lines.push(`[Assistant]: ${prose.trim()}`);
         if (calls.length > 0) lines.push(`[Assistant tool calls] (outputs removed): ${calls.join("; ")}`);
         break;
       }
       case "toolResult":
-        // removed by design (kept in the dump)
+        // removed by design (kept in the session)
         break;
       case "bashExecution":
-        lines.push(`[BashExecution]: $ ${String(m.command ?? "")}  (output removed — see dump)`);
+        lines.push(`[BashExecution]: $ ${String(m.command ?? "")}  (output removed — use context_lookup)`);
         break;
       case "custom":
         lines.push(`[Custom]: ${textOf(m.content).text}`);
@@ -448,7 +329,7 @@ function summarizeMessages(messages: AgentMessage[]): string[] {
 
 const SECTION_HEADER = "### Compacted conversation (oldest first)";
 const SPAN_CLOSE = "</compacted-span>";
-const SPAN_TRIMMED_NOTE = "(trimmed for size — see dump)";
+const SPAN_TRIMMED_NOTE = "(trimmed for size — use context_lookup)";
 const SPAN_TRIMMED_ATTR = ' trimmed="true"';
 const BASE_CLOSE = "</compacted-base>";
 
@@ -465,7 +346,7 @@ function spanOpen(n: number, compactedAt: string, reason: string, covers?: strin
  * legacy (nested-format) mech checkpoint. Everything before it is covered by
  * its opaque summary text. Spans = mech entries with details.span after the
  * base, oldest first. Spans before the base are deliberately NOT re-rendered
- * (the base is opaque; the dump holds the truth).
+ * (the base is opaque; the session holds the raw history).
  */
 function collectBaseAndSpans(branchEntries: SessionEntry[]): {
   base: { kind: "model-summary" | "legacy-checkpoint"; at: string; summary: string } | null;
@@ -517,7 +398,7 @@ function collectBaseAndSpans(branchEntries: SessionEntry[]): {
  * exceeded, (1) drop the oldest non-user lines, (2) stub each oversized user
  * line at most once in a single forward pass (never re-stub → no loops),
  * (3) drop the oldest remaining lines until under budget. Everything dropped
- * remains in the dump.
+ * remains in the session.
  */
 function capSpans(spans: string[][], budget: number): string[][] {
   const items: { span: number; line: string }[] = spans.flatMap((lines, span) => lines.map((line) => ({ span, line })));
@@ -538,7 +419,7 @@ function capSpans(spans: string[][], budget: number): string[][] {
   for (let i = 0; i < items.length && over(); i++) {
     const line = items[i].line;
     if (!line.startsWith("[User]:") || line.length <= 120) continue;
-    const stub = `${line.slice(0, 120)}…[truncated +${line.length - 120} chars — see dump]`;
+    const stub = `${line.slice(0, 120)}…[truncated +${line.length - 120} chars — use context_lookup]`;
     if (stub.length >= line.length) continue; // stubbing would not shrink it; step 3 drops it
     size += stub.length - line.length;
     items[i] = { ...items[i], line: stub };
@@ -555,10 +436,9 @@ const REORIENT_BLOCK = `**Re-orient before continuing.** The dropped context con
 3. Re-read any file you are about to modify — do not trust content you only remember from before the compaction.
 4. **Treat other pre-compaction knowledge as unverified too.** Tool outputs were removed. Anything you know only from them — or from earlier assistant prose describing them — is a note, not evidence. Before you state it as fact or base a decision on it, re-read the source or ask \`context_lookup\`. If you cannot verify it, say explicitly that it is unverified.
 
-**Recovering dropped details.** Information removed from your active context is preserved in the transcript dump. Use \`context_lookup\` to recover relevant details, including earlier thinking and tool outputs. Do NOT grep the dump yourself in this conversation — that would fill your context with raw transcript text. Call the \`context_lookup\` tool with a specific question; a subagent greps the dump in its own context and returns only the relevant findings.`;
+**Recovering dropped details.** Information removed from your active context is preserved in the session. Use \`context_lookup\` to recover relevant details, including earlier thinking and tool outputs. Do NOT grep the session file yourself in this conversation — that would fill your context with raw transcript text. Call the \`context_lookup\` tool with a specific question; a subagent searches the session transcript in its own context and returns only the relevant findings.`;
 
 function buildMechanicalSummary(opts: {
-  dumpDir: string;
   reason: string; // pi's raw reason: "manual" | "threshold" | "overflow"
   tokensBefore: number;
   branchEntries: SessionEntry[];
@@ -621,14 +501,13 @@ function buildMechanicalSummary(opts: {
   parts.push(
     "- pi keeps the most recent part of the conversation verbatim (its `keepRecentTokens` setting). The spans below cover only what came *before* that; everything after the last span is uncompacted.",
   );
-  parts.push(`- Full transcript (all spans, thinking + tool outputs, untruncated): ${path.join(opts.dumpDir, "conversation.md")}`);
-  parts.push("- Information removed from active context remains preserved in the transcript dump; recover it with `context_lookup` (including thinking and tool outputs).");
+  parts.push("- The full transcript before this point is kept in the session; use `context_lookup` to recover details (including thinking and tool outputs).");
   parts.push("");
   parts.push(REORIENT_BLOCK);
   parts.push("");
   parts.push(SECTION_HEADER);
   parts.push("");
-  parts.push(blocks.length > 0 ? blocks.join("\n\n") : "(no user or assistant prose in these spans — see dump)");
+  parts.push(blocks.length > 0 ? blocks.join("\n\n") : "(no user or assistant prose in these spans — use context_lookup)");
   // The file lists describe the compacted spans, so they belong above the
   // verbatim boundary line. That closing line is the LAST line of the
   // checkpoint; everything after it is pi's retained verbatim tail.
@@ -645,102 +524,59 @@ function buildMechanicalSummary(opts: {
 }
 
 // ============================================================================
-// context_lookup subagent: greps dumps in its own context, returns findings
+// context_lookup subagent: searches the transcript in its own context
 // ============================================================================
 
-interface DumpFile {
-  /** directory name under .pi/context-dumps (or basename of an absolute path) */
+interface Transcript {
+  /** Logical transcript name for subagent citations; never a filesystem path. */
   name: string;
-  /** absolute path to conversation.md */
   file: string;
-  /** raw content cache (physical lines) */
+  /** Rendered raw branch, with physical lines and an authoritative entry index. */
   lines: string[];
-  /** dump-time entry index from meta.json; absent for pre-index dumps (scan fallback) */
-  index?: DumpIndexEntry[];
+  index: TranscriptIndexEntry[];
 }
 
-function loadDumpFiles(dirs: string[]): DumpFile[] {
-  const out: DumpFile[] = [];
-  for (const dir of dirs) {
-    const file = path.isAbsolute(dir) ? path.join(dir, "conversation.md") : dir.endsWith(".md") ? dir : path.join(dir, "conversation.md");
-    try {
-      const raw = fs.readFileSync(file, "utf8");
-      let index: DumpIndexEntry[] | undefined;
-      try {
-        const meta = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "meta.json"), "utf8")) as { index?: unknown };
-        if (Array.isArray(meta.index)) index = meta.index as DumpIndexEntry[];
-      } catch {
-        // pre-index dump: scanning fallback
-      }
-      out.push({ name: path.basename(path.dirname(file)), file, lines: raw.split("\n"), index });
-    } catch {
-      // missing file: skip
+/** Entry/section owning a physical line. Only the renderer index is trusted:
+ * ENTRY-like text and rules inside tool output cannot spoof attribution. */
+function entryAt(lines: string[], idx: number, index: TranscriptIndexEntry[]): { id: string; header: string; section?: string } | undefined {
+  const lineNo = idx + 1;
+  let lo = 0;
+  let hi = index.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (index[mid].startLine <= lineNo) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
     }
   }
-  return out;
+  if (found < 0) return undefined;
+  const e = index[found];
+  if (lineNo > e.endLine) return undefined;
+  let section: string | undefined;
+  for (const s of e.sections ?? []) if (s.startLine <= lineNo) section = s.kind;
+  return { id: e.id, header: lines[e.startLine - 1] ?? "", section };
 }
 
-/**
- * Entry (and section, for assistant entries) owning a 0-based line position.
- * Uses the dump-time index when present, so transcript content that looks like
- * ENTRY headers or ==== rules can no longer spoof attribution; falls back to
- * scanning for pre-index dumps.
- */
-function entryAt(lines: string[], idx: number, index?: DumpIndexEntry[]): { id: string; header: string; section?: string } | undefined {
-  const lineNo = idx + 1; // 1-based
-  if (index && index.length > 0) {
-    let lo = 0;
-    let hi = index.length - 1;
-    let found = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (index[mid].startLine <= lineNo) {
-        found = mid;
-        lo = mid + 1;
-      } else {
-        hi = mid - 1;
-      }
-    }
-    if (found < 0) return undefined;
-    const e = index[found];
-    if (lineNo > e.endLine) return undefined;
-    let section: string | undefined;
-    for (const s of e.sections ?? []) if (s.startLine <= lineNo) section = s.kind;
-    return { id: e.id, header: lines[e.startLine - 1] ?? "", section };
-  }
-  for (let i = idx; i >= 0; i--) {
-    const m = lines[i].match(/^ENTRY (\S+)  (.+)$/);
-    if (m) return { id: m[1], header: lines[i] };
-  }
-  return undefined;
-}
-
-function listEntries(dumps: DumpFile[], file?: string): string {
-  const targets = file ? dumps.filter((d) => d.name === file) : dumps;
+function listEntries(transcripts: Transcript[], file?: string): string {
+  const targets = file ? transcripts.filter((d) => d.name === file) : transcripts;
   const parts: string[] = [];
   for (const d of targets) {
-    let rows: string[];
-    if (d.index && d.index.length > 0) {
-      rows = d.index.map((e) => {
-        const header = d.lines[e.startLine - 1] ?? "";
-        const next = d.lines[e.startLine] ?? "";
-        const preview = next.trim() !== "" && !next.startsWith(HR) ? `  ${next.trim().slice(0, 90)}` : "";
-        return `${header}${preview}`;
-      });
-    } else {
-      rows = d.lines.filter((l) => l.startsWith("ENTRY ")).map((l) => {
-        const next = d.lines[d.lines.indexOf(l) + 1];
-        const preview = next && !next.startsWith(HR) && next.trim() !== "" ? `  ${next.trim().slice(0, 90)}` : "";
-        return `${l}${preview}`;
-      });
-    }
+    const rows = d.index.map((e) => {
+      const header = d.lines[e.startLine - 1] ?? "";
+      const next = d.lines[e.startLine] ?? "";
+      const preview = next.trim() !== "" && !next.startsWith(HR) ? `  ${next.trim().slice(0, 90)}` : "";
+      return `${header}${preview}`;
+    });
     parts.push(`### ${d.name} (${rows.length} entries)\n${rows.join("\n")}`);
   }
-  return parts.join("\n\n") || "(no dump files)";
+  return parts.join("\n\n") || "(no transcript entries)";
 }
 
-function grepDump(dumps: DumpFile[], opts: { pattern: string; file?: string; before?: number; after?: number; maxMatches?: number }): string {
-  const targets = opts.file ? dumps.filter((d) => d.name === opts.file) : dumps;
+function grepTranscript(transcripts: Transcript[], opts: { pattern: string; file?: string; before?: number; after?: number; maxMatches?: number }): string {
+  const targets = opts.file ? transcripts.filter((d) => d.name === opts.file) : transcripts;
   let re: RegExp;
   try {
     re = new RegExp(opts.pattern, "i");
@@ -771,35 +607,18 @@ function grepDump(dumps: DumpFile[], opts: { pattern: string; file?: string; bef
       out.push(d.lines.slice(from, to + 1).map((l, n) => (n + from === i ? `>> ${l}` : `   ${l}`)).join("\n"));
     }
   }
-  if (matches === 0) return `No matches for /${opts.pattern}/ in ${targets.map((t) => t.name).join(", ") || "(no dumps)"}.`;
+  if (matches === 0) return `No matches for /${opts.pattern}/ in ${targets.map((t) => t.name).join(", ") || "(no transcripts)"}.`;
   return truncateMiddle(out.join("\n\n"), cfg.grepMaxChars);
 }
 
-function showEntry(dumps: DumpFile[], opts: { id: string; file?: string; maxLines?: number }): string {
-  const targets = opts.file ? dumps.filter((d) => d.name === opts.file) : dumps;
+function showEntry(transcripts: Transcript[], opts: { id: string; file?: string; maxLines?: number }): string {
+  const targets = opts.file ? transcripts.filter((d) => d.name === opts.file) : transcripts;
   const maxLines = Math.max(10, opts.maxLines ?? 400);
   const out: string[] = [];
   for (const d of targets) {
-    let block: string[] | undefined;
-    if (d.index && d.index.length > 0) {
-      const e = d.index.find((x) => x.id === opts.id);
-      if (e) block = d.lines.slice(e.startLine - 2, e.endLine); // includes the HR line before the header
-    } else {
-      const start = d.lines.findIndex((l) => l.startsWith(`ENTRY ${opts.id} `) || l === `ENTRY ${opts.id}`);
-      if (start >= 0) {
-        // block starts at the HR line just before the header (if any)
-        const from = start > 0 && d.lines[start - 1].startsWith(HR) ? start - 1 : start;
-        let end = d.lines.length;
-        for (let i = start + 1; i < d.lines.length; i++) {
-          if (d.lines[i].startsWith(HR)) {
-            end = i;
-            break;
-          }
-        }
-        block = d.lines.slice(from, end);
-      }
-    }
-    if (!block) continue;
+    const e = d.index.find((x) => x.id === opts.id);
+    if (!e) continue;
+    const block = d.lines.slice(e.startLine - 2, e.endLine); // includes the rule before the header
     const shown = block.slice(0, maxLines);
     out.push(`### ${d.name}\n${shown.join("\n")}${block.length > maxLines ? `\n…[+${block.length - maxLines} more lines — grep with more context or re-call]` : ""}`);
   }
@@ -833,19 +652,19 @@ Grep attributions include a section tag like [thinking] / [text] / [toolCall]. W
 
 async function runLookupSubagent(opts: {
   question: string;
-  dumps: DumpFile[];
+  transcripts: Transcript[];
   model: Model;
   registry: ModelRegistry;
   signal: AbortSignal | undefined;
 }): Promise<string> {
-  const toc = truncateMiddle(listEntries(opts.dumps).split("\n").slice(0, 60).join("\n"), 4_000);
+  const toc = truncateMiddle(listEntries(opts.transcripts).split("\n").slice(0, 60).join("\n"), 4_000);
 
   const tools: AiTool[] = [
     {
       name: "list_entries",
-      description: "List every ENTRY header in the transcript (id, role, timestamp, first-line preview). Optional `file` restricts to one dump directory name.",
+      description: "List every ENTRY header in the transcript (id, role, timestamp, first-line preview). Optional `file` restricts to a transcript name.",
       parameters: Type.Object({
-        file: Type.Optional(Type.String({ description: "Dump directory name (see transcript file list). Omit for all." })),
+        file: Type.Optional(Type.String({ description: "Transcript name (see transcript file list). Omit for all." })),
       }),
     },
     {
@@ -853,7 +672,7 @@ async function runLookupSubagent(opts: {
       description: "Regex-search the transcript lines. Returns matching lines with surrounding context and entry attribution. `pattern` is a JS regex (case-insensitive).",
       parameters: Type.Object({
         pattern: Type.String({ description: "JS regex, case-insensitive" }),
-        file: Type.Optional(Type.String({ description: "Dump directory name. Omit for all." })),
+        file: Type.Optional(Type.String({ description: "Transcript name. Omit for all." })),
         before: Type.Optional(Type.Number({ description: "Context lines before (default 2)" })),
         after: Type.Optional(Type.Number({ description: "Context lines after (default 6)" })),
         maxMatches: Type.Optional(Type.Number({ description: "Max matches per file (default 15)" })),
@@ -864,7 +683,7 @@ async function runLookupSubagent(opts: {
       description: "Print one full entry block by its ENTRY id (from list_entries or grep attribution).",
       parameters: Type.Object({
         id: Type.String({ description: "Entry id" }),
-        file: Type.Optional(Type.String({ description: "Dump directory name. Omit for all." })),
+        file: Type.Optional(Type.String({ description: "Transcript name. Omit for all." })),
         maxLines: Type.Optional(Type.Number({ description: "Max lines to return (default 400)" })),
       }),
     },
@@ -875,8 +694,8 @@ async function runLookupSubagent(opts: {
       role: "user",
       content:
         `Question: ${opts.question}\n\n` +
-        `Transcript files (full pre-compaction dumps; ENTRY blocks are anchored by entry id):\n` +
-        opts.dumps.map((d) => `- ${d.file}`).join("\n") +
+        `Transcript files (full raw session branch; ENTRY blocks are anchored by entry id):\n` +
+        opts.transcripts.map((d) => `- ${d.file}`).join("\n") +
         `\n\nTranscript overview (first entries; call list_entries for the full list):\n${toc}`,
       timestamp: Date.now(),
     },
@@ -886,11 +705,11 @@ async function runLookupSubagent(opts: {
     try {
       switch (name) {
         case "list_entries":
-          return listEntries(opts.dumps, args.file);
+          return listEntries(opts.transcripts, args.file);
         case "grep":
-          return grepDump(opts.dumps, args);
+          return grepTranscript(opts.transcripts, args);
         case "show_entry":
-          return showEntry(opts.dumps, args);
+          return showEntry(opts.transcripts, args);
         default:
           return `Unknown tool: ${name}`;
       }
@@ -954,218 +773,26 @@ async function runLookupSubagent(opts: {
 }
 
 // ============================================================================
-// Dump resolution (for context_lookup)
+// Session-backed transcript (rendered only when context_lookup is called)
 // ============================================================================
 
-function dumpRoot(cwd: string): string {
-  return dumpDirOverride ?? path.join(cwd, ...DUMP_ROOT_PARTS);
-}
-
-function listDumpDirs(cwd: string): string[] {
-  try {
-    return fs
-      .readdirSync(dumpRoot(cwd), { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name)
-      .sort();
-  } catch {
-    return [];
+function sessionTranscript(ctx: { sessionManager: { getBranch: () => SessionEntry[] } }): Transcript {
+  const override = process.env.MECH_COMPACT_LOOKUP_SESSION_FILE?.trim();
+  let entries: SessionEntry[];
+  if (override) {
+    // Fail closed: never silently search the pruned fork when an override is
+    // misconfigured. Guard open() because pi initializes empty/missing files.
+    if (!path.isAbsolute(override)) throw new Error("MECH_COMPACT_LOOKUP_SESSION_FILE must be an absolute path.");
+    const stat = fs.statSync(override);
+    if (!stat.isFile() || stat.size === 0) throw new Error("MECH_COMPACT_LOOKUP_SESSION_FILE must name a non-empty session JSONL file.");
+    entries = SessionManager.open(override).getBranch();
+  } else {
+    // getBranch() is raw history, unlike buildSessionContext(): compaction
+    // and context edits never remove earlier thinking or tool results here.
+    entries = ctx.sessionManager.getBranch();
   }
-}
-
-function dumpSessionFile(dir: string): string | null {
-  try {
-    const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as { sessionFile?: unknown };
-    return typeof meta.sessionFile === "string" ? meta.sessionFile : null;
-  } catch {
-    return null;
-  }
-}
-
-function dumpMetaTime(dir: string): number {
-  try {
-    const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as { timestamp?: unknown };
-    const t = Date.parse(String(meta.timestamp ?? ""));
-    return Number.isFinite(t) ? t : 0;
-  } catch {
-    return 0;
-  }
-}
-
-/**
- * The set of session entry ids a parsed dump meta indexes, or null when the
- * meta has no index (pre-index dump). Ids missing from index entries (the
- * session header has none) are ignored.
- */
-function indexIdSet(meta: { index?: unknown }): Set<string> | null {
-  if (!Array.isArray(meta.index)) return null;
-  const ids = new Set<string>();
-  for (const item of meta.index) {
-    const id = (item as { id?: unknown })?.id;
-    if (typeof id === "string" && id !== "") ids.add(id);
-  }
-  return ids;
-}
-
-/**
- * The set of session entry ids a dump contains, read from its meta.json.
- * Returns null for a pre-index dump or an unreadable/invalid meta.json.
- */
-function dumpIndexIds(dir: string): Set<string> | null {
-  try {
-    return indexIdSet(JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as { index?: unknown });
-  } catch {
-    return null;
-  }
-}
-
-/** The first session entry id on the branch (the session header has none). */
-function firstEntryId(entries: SessionEntry[]): string | null {
-  for (const e of entries) {
-    const id = (e as { id?: unknown }).id;
-    if (typeof id === "string" && id !== "") return id;
-  }
-  return null;
-}
-
-/** All session entry ids a branch contains (entry ids are random per entry). */
-function entryIdSet(entries: SessionEntry[]): Set<string> {
-  const ids = new Set<string>();
-  for (const e of entries) {
-    const id = (e as { id?: unknown }).id;
-    if (typeof id === "string" && id !== "") ids.add(id);
-  }
-  return ids;
-}
-
-/**
- * Ownership: does a dump dir under `root` belong to the current session?
- * Indexed dumps match when their index contains the branch's first entry id
- * (entry ids are random per session, so other sessions' dumps never match —
- * and ephemeral sessions are scoped too). Pre-index dumps fall back to the
- * meta.json sessionFile comparison, and only when the current session has a
- * file; without one they are excluded.
- */
-function dumpOwnership(root: string, sessionFile: string | null, firstId: string | null): (name: string) => boolean {
-  return (name: string): boolean => {
-    const dir = path.join(root, name);
-    const ids = dumpIndexIds(dir);
-    if (ids !== null) return firstId !== null && ids.has(firstId);
-    return sessionFile !== null && dumpSessionFile(dir) === sessionFile;
-  };
-}
-
-/**
- * Prune dumps that are provably contained in the dump just written, after the
- * new dump is fully on disk. Every dump re-serializes the whole branch, so on
- * the same branch each new dump is a superset of earlier ones; the redundant
- * copies waste disk and make dumpDir:"all" return duplicate matches. A
- * candidate is deleted only if EVERY entry id in its index is present in the
- * new dump — so dumps holding /tree-abandoned branches, pre-index dumps,
- * unreadable metas, and other sessions' dumps are never touched. Pruning
- * failures never fail or alter the compaction; they are reported only.
- */
-function pruneRedundantDumps(opts: {
-  cwd: string;
-  newDumpDir: string;
-  newIds: Set<string>;
-  sessionFile: string | null;
-  firstId: string | null;
-  notify?: (msg: string, level?: "info" | "warning" | "error") => void;
-}): void {
-  const { cwd, newDumpDir, newIds, sessionFile, firstId, notify } = opts;
-  try {
-    const root = dumpRoot(cwd);
-    const rootReal = fs.realpathSync(root);
-    const newReal = fs.realpathSync(newDumpDir);
-    const owns = dumpOwnership(root, sessionFile, firstId);
-    const unreadable: string[] = [];
-    let removed = 0;
-    for (const name of listDumpDirs(cwd)) {
-      const dir = path.join(root, name);
-      let real: string;
-      try {
-        real = fs.realpathSync(dir);
-      } catch {
-        continue; // vanished mid-scan: leave it
-      }
-      if (real === newReal) continue; // the dump just written
-      if (!real.startsWith(rootReal + path.sep)) continue; // only ever delete inside the dump root
-      let meta: { index?: unknown };
-      try {
-        meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as { index?: unknown };
-      } catch {
-        unreadable.push(name);
-        continue; // unreadable meta.json: never touch, report below
-      }
-      const ids = indexIdSet(meta);
-      if (ids === null || ids.size === 0) continue; // pre-index (or no ids): containment not provable
-      if (!owns(name)) continue; // other session's dump: never touch
-      let contained = true;
-      for (const id of ids) if (!newIds.has(id)) { contained = false; break; }
-      if (!contained) continue; // holds entries the new dump lacks (e.g. an abandoned branch)
-      fs.rmSync(dir, { recursive: true, force: true });
-      removed++;
-    }
-    if (unreadable.length > 0) {
-      notify?.(`verbatim-compact: pruning skipped ${unreadable.length} dump dir(s) with unreadable meta.json: ${unreadable.join(", ")}`, "warning");
-    }
-    if (removed > 0) {
-      notify?.(`verbatim-compact: pruned ${removed} redundant dump(s) — every entry is in the new dump`, "info");
-    }
-  } catch (err) {
-    notify?.(`verbatim-compact: dump pruning failed (${errMsg(err)}); older dumps kept`, "warning");
-  }
-}
-
-/**
- * Resolve which dump conversation.md files to search.
- * Dumps are scoped to the current session by entry-id overlap (see
- * dumpOwnership): a dump's meta.json index must contain the current branch's
- * first entry id; pre-index dumps fall back to the meta.json sessionFile
- * match, and are excluded when the current session has no file. Explicit
- * directory names or absolute paths bypass scoping (the caller chose them
- * deliberately).
- * - explicit dir name or absolute path
- * - "all" -> every non-redundant dump of this session (redundant dumps are
- *   pruned after each write; unique value: /tree-abandoned branches)
- * - default -> dump recorded on the newest mech-compact entry in the branch, else newest dir of this session
- */
-function resolveDumpFiles(
-  ctx: { cwd: string; sessionManager?: { getBranch?: () => SessionEntry[]; getSessionFile?: () => string | null } },
-  dumpDir?: string,
-): string[] {
-  const root = dumpRoot(ctx.cwd);
-  const branch = ctx.sessionManager?.getBranch?.() ?? [];
-  const owns = dumpOwnership(root, safeSessionFile(ctx), firstEntryId(branch));
-  const names = listDumpDirs(ctx.cwd).filter(owns);
-
-  if (dumpDir && dumpDir !== "all") {
-    if (path.isAbsolute(dumpDir)) return [dumpDir];
-    const p = path.join(root, dumpDir);
-    return fs.existsSync(path.join(p, "conversation.md")) ? [p] : [];
-  }
-  if (dumpDir === "all") return names.map((n) => path.join(root, n));
-
-  // default: newest mech-compact entry's dumpDir, else newest directory of this session
-  try {
-    for (let i = branch.length - 1; i >= 0; i--) {
-      const e = branch[i];
-      if (e.type === "compaction") {
-        const d = (e as { details?: { kind?: string; dumpDir?: string } }).details;
-        if (d?.kind === MECH_KIND && d.dumpDir && fs.existsSync(path.join(d.dumpDir, "conversation.md"))) return [d.dumpDir];
-      }
-    }
-  } catch {
-    // fall through to newest dir
-  }
-  if (names.length === 0) return [];
-  // "newest" by meta.json timestamp (dir names carry a random suffix, so
-  // lexicographic order is not chronological within the same second)
-  const stamped = names
-    .map((n) => ({ n, t: dumpMetaTime(path.join(root, n)) }))
-    .sort((a, b) => b.t - a.t);
-  return [path.join(root, stamped[0].n)];
+  const { lines, index } = branchToTranscript(entries);
+  return { name: "session", file: "session", lines, index };
 }
 
 // ============================================================================
@@ -1182,34 +809,9 @@ export default function (pi: ExtensionAPI) {
     if (signal?.aborted) return;
     if (preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0) return;
 
-    // 1) Dump the full pre-compaction branch (full fidelity) first.
-    let dump: DumpInfo;
-    try {
-      dump = writeDump({
-        entries: branchEntries,
-        cwd: ctx.cwd,
-        sessionFile: safeSessionFile(ctx),
-        reason,
-        tokensBefore: preparation.tokensBefore,
-        firstKeptEntryId: preparation.firstKeptEntryId,
-      });
-    } catch (err) {
-      ctx.ui?.notify?.(`verbatim-compact: dump failed (${errMsg(err)}); falling back to default compaction`, "error");
-      return;
-    }
-    // 1b) Prune older dumps this one supersedes (never affects the compaction).
-    pruneRedundantDumps({
-      cwd: ctx.cwd,
-      newDumpDir: dump.dir,
-      newIds: entryIdSet(branchEntries),
-      sessionFile: safeSessionFile(ctx),
-      firstId: firstEntryId(branchEntries),
-      notify: (m, level) => ctx.ui?.notify?.(m, level),
-    });
-    // 1c) Security note: warn once if dumps land in a git repo that doesn't ignore them.
-    warnIfDumpsNotIgnored(ctx.cwd, (m, level) => ctx.ui?.notify?.(m, level));
+    // No disk snapshot: pi retains the full raw branch in its session.
 
-    // 2) Cumulative file lists: pi only carries lists from pi-generated
+    // 1) Cumulative file lists: pi only carries lists from pi-generated
     //    compactions (fromHook=false), so we carry our own forward.
     try {
       const fileOps = preparation.fileOps as { read: Set<string>; written: Set<string>; edited: Set<string> } | undefined;
@@ -1231,7 +833,7 @@ export default function (pi: ExtensionAPI) {
       const modifiedFiles = [...modified].sort();
       const readFiles = [...(fileOps?.read ?? [])].filter((f) => !modified.has(f)).sort();
 
-      // 3) The new span. Pi's preparation span is [previous cut, current cut)
+      // 2) The new span. Pi's preparation span is [previous cut, current cut)
       //    — it includes the previous compaction's retained tail (verified
       //    against prepareCompaction: the projection places the retained tail
       //    right after the previous compaction entry and boundaryStart sits at
@@ -1251,9 +853,8 @@ export default function (pi: ExtensionAPI) {
       const spanTo = toIso(msgTs(allMessages[allMessages.length - 1]));
       const spanLines = summarizeMessages(allMessages);
 
-      // 4) Build the mechanical summary (no LLM call).
+      // 3) Build the mechanical summary (no LLM call).
       const summary = buildMechanicalSummary({
-        dumpDir: dump.dir,
         reason, // pi's raw reason, passed through unchanged
         tokensBefore: preparation.tokensBefore,
         branchEntries,
@@ -1268,7 +869,7 @@ export default function (pi: ExtensionAPI) {
       });
 
       ctx.ui?.notify?.(
-        `verbatim-compact: ~${preparation.tokensBefore.toLocaleString()} tokens -> verbatim checkpoint; full dump at ${dump.dir}`,
+        `verbatim-compact: ~${preparation.tokensBefore.toLocaleString()} tokens -> verbatim checkpoint; full transcript kept in the session`,
         "info",
       );
 
@@ -1279,7 +880,6 @@ export default function (pi: ExtensionAPI) {
           tokensBefore: preparation.tokensBefore,
           details: {
             kind: MECH_KIND,
-            dumpDir: dump.dir,
             readFiles,
             modifiedFiles,
             // Only this compaction's own span (un-capped lines). Earlier spans
@@ -1295,94 +895,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   // --------------------------------------------------------------------------
-  // On-demand dump: /dump-context command + dump_context tool
-  // --------------------------------------------------------------------------
-  const doDump = async (
-    ctx: {
-      cwd: string;
-      sessionManager?: { getBranch?: () => SessionEntry[]; getSessionFile?: () => string | null };
-      ui?: { notify?: (message: string, level?: "info" | "warning" | "error") => void };
-    },
-    note?: string,
-  ): Promise<DumpInfo> => {
-    const entries = ctx.sessionManager?.getBranch?.() ?? [];
-    const sessionFile = safeSessionFile(ctx);
-    const info = writeDump({
-      entries,
-      cwd: ctx.cwd,
-      sessionFile,
-      reason: note ? `on-demand: ${note}` : "on-demand",
-    });
-    pruneRedundantDumps({
-      cwd: ctx.cwd,
-      newDumpDir: info.dir,
-      newIds: entryIdSet(entries),
-      sessionFile,
-      firstId: firstEntryId(entries),
-      notify: (m, level) => ctx.ui?.notify?.(m, level),
-    });
-    warnIfDumpsNotIgnored(ctx.cwd, (m, level) => ctx.ui?.notify?.(m, level));
-    return info;
-  };
-
-  pi.registerCommand("dump-context", {
-    description: "Dump the full current context (thinking + tool outputs) to .pi/context-dumps/ without compacting",
-    handler: async (args, ctx) => {
-      try {
-        const info = await doDump(ctx, args?.trim() || undefined);
-        ctx.ui.notify(`Context dumped to ${info.conversationPath} (${(info.chars / 1000).toFixed(1)}k chars)`, "info");
-      } catch (err) {
-        ctx.ui.notify(`dump-context failed: ${errMsg(err)}`, "error");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "dump_context",
-    label: "Dump context",
-    description:
-      "Snapshot the entire current session context (including thinking blocks and full tool outputs) to <project>/.pi/context-dumps/<timestamp>_<id>/conversation.md. Use when the user asks to save/dump/snapshot the current context, or before work that risks context overflow. Returns the dump directory.",
-    promptSnippet: "Dump the full current context to .pi/context-dumps/ for later grepping",
-    parameters: Type.Object({
-      note: Type.Optional(Type.String({ description: "Optional note recorded in meta.json" })),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      try {
-        const info = await doDump(ctx, params.note);
-        return {
-          content: [{ type: "text", text: `Context dumped to ${info.conversationPath} (${info.chars} chars). Grep it with: rg <pattern> ${info.dir}` }],
-        };
-      } catch (err) {
-        return { content: [{ type: "text", text: `dump_context failed: ${errMsg(err)}` }] };
-      }
-    },
-  });
-
-  // --------------------------------------------------------------------------
-  // context_lookup tool: subagent research over the dumps
+  // context_lookup tool: subagent research over the raw session branch
   // --------------------------------------------------------------------------
   pi.registerTool({
     name: "context_lookup",
     label: "Context lookup",
     description:
-      "Recover information preserved in transcript dumps but removed from your active context by verbatim compaction—including thinking, tool outputs, error text, file contents, and earlier decisions. Spawns a subagent that greps the full pre-compaction dump(s) in .pi/context-dumps/ in its OWN context and returns only the relevant findings. Do NOT grep the dumps yourself in the main conversation.",
-    promptSnippet: "Ask a subagent to research dropped context in the pre-compaction dumps",
+      "Recover information preserved in the session but removed from your active context by verbatim compaction—including thinking, tool outputs, error text, file contents, and earlier decisions. Spawns a subagent that searches the full raw session branch (across all compactions) in its OWN context and returns only relevant findings. Does not search abandoned branches or other sessions. Do NOT grep the session file yourself in the main conversation.",
+    promptSnippet: "Ask a subagent to research dropped context in the session transcript",
     parameters: Type.Object({
       question: Type.String({ description: "What to find in the dropped context. Be specific (exact error text, file, decision, command output…)." }),
-      dumpDir: Type.Optional(
-        Type.String({ description: "Dump directory name or absolute path to search. Default: the dump referenced by the latest verbatim checkpoint. Every dump re-serializes the whole branch, so the default already covers the session's full history. \"all\" searches every non-redundant dump of this session (superseded dumps are pruned after each write) — rarely needed; the one case it uniquely helps is history of a branch abandoned via /tree. Dumps are scoped to this session by entry-id overlap." }),
-      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const files = resolveDumpFiles(ctx, params.dumpDir);
-      if (files.length === 0) {
-        return { content: [{ type: "text", text: `No context dumps found under ${dumpRoot(ctx.cwd)}/. Verbatim compaction creates them; /dump-context can create one now.` }] };
-      }
-      const dumps = loadDumpFiles(files);
-      if (dumps.length === 0) {
-        return { content: [{ type: "text", text: "Dump directories found but no readable conversation.md files." }] };
-      }
-
       let model: Model | undefined;
       if (cfg.lookupModel) {
         const slash = cfg.lookupModel.indexOf("/");
@@ -1390,14 +914,18 @@ export default function (pi: ExtensionAPI) {
       }
       model = model ?? ctx.model;
       if (!model) {
-        return { content: [{ type: "text", text: "context_lookup needs a model (session model or MECH_COMPACT_LOOKUP_MODEL)." }] };
+        return { content: [{ type: "text", text: "context_lookup needs a model (session model or MECH_COMPACT_LOOKUP_MODEL)." }], details: undefined };
       }
 
       try {
-        const answer = await runLookupSubagent({ question: params.question, dumps, model, registry: ctx.modelRegistry, signal });
-        return { content: [{ type: "text", text: answer }] };
+        if (signal?.aborted) return { content: [{ type: "text", text: "(lookup subagent aborted)" }], details: undefined };
+        const transcript = sessionTranscript(ctx);
+        if (transcript.index.length === 0)
+          return { content: [{ type: "text", text: "No entries found on the session branch." }], details: undefined };
+        const answer = await runLookupSubagent({ question: params.question, transcripts: [transcript], model, registry: ctx.modelRegistry, signal });
+        return { content: [{ type: "text", text: answer }], details: undefined };
       } catch (err) {
-        return { content: [{ type: "text", text: `context_lookup failed: ${errMsg(err)}` }] };
+        return { content: [{ type: "text", text: `context_lookup failed: ${errMsg(err)}` }], details: undefined };
       }
     },
   });

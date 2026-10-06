@@ -2,7 +2,7 @@
   "name": "verbatim-compact",
   "version": "0.1.0",
   "private": true,
-  "description": "Deterministic, verbatim-preserving compaction for Pi, with transcript dumps and subagent context recovery.",
+  "description": "Deterministic, verbatim-preserving compaction for Pi, with session-backed subagent context recovery.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -33,8 +33,6 @@
     "test:cap": "node test.cjs cap",
     "test:caphang": "node test.cjs caphang",
     "test:capspans": "node test.cjs capspans",
-    "test:dumpdir": "node test.cjs dumpdir",
-    "test:nowarn": "node test.cjs nowarn",
     "test:package": "node scripts/test-package.cjs"
   },
   "peerDependencies": {

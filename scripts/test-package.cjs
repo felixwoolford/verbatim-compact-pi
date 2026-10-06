@@ -48,14 +48,16 @@ async function main() {
     assert.deepEqual(loaded.errors, [], "real Pi extension loader reports no errors");
     assert.equal(loaded.extensions.length, 1);
     const extension = loaded.extensions[0];
-    assert(extension.tools.has("dump_context"));
-    assert(extension.tools.has("context_lookup"));
-    assert(extension.commands.has("dump-context"));
+    assert.deepEqual([...extension.tools.keys()], ["context_lookup"], "only the session lookup tool is registered");
+    assert.equal(extension.commands.size, 0, "no dump command is registered");
+    const lookup = extension.tools.get("context_lookup");
+    assert.deepEqual(Object.keys(lookup.definition.parameters.properties), ["question"], "lookup has no dump-selection argument");
     const skills = loadSkills({ cwd: root, agentDir: temp, skillPaths, includeDefaults: false });
     assert.equal(skills.skills.length, 1);
     assert.equal(skills.skills[0].name, "context-retrieval");
     assert.deepEqual(skills.diagnostics, []);
-    console.log("PACKAGE TEST OK — manifest, packed resources, real Pi loader, tools, command, and bundled skill");
+    assert.equal([...packedPaths].filter((p) => p.startsWith("source/extensions/")).length, 1, "package ships one extension under its public name");
+    console.log("PACKAGE TEST OK — manifest, packed resources, real Pi loader, session lookup, and bundled skill");
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }

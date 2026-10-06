@@ -6,6 +6,11 @@ integration test suite. Compaction timings below exclude subsequent lookup
 work. The local deployment example in the README is not a separate hardware
 benchmark.
 
+**Implementation note:** this historical pilot used separate transcript dumps
+for lookup. The current release instead renders Pi's raw session branch in memory
+when lookup is called. The figures below have not been re-measured for that
+implementation; descriptions of dumps below refer to the pilot's implementation.
+
 ## Does the agent know what it lost?
 
 We gave a coding agent long debugging sessions, compacted its context three times, and after each compaction asked it about details from the start of the session. We compared pi's default compaction (a model-written summary) with **verbatim-compact**, which retains user messages and assistant text (subject to a size guard), removes thinking and tool outputs from active context, and preserves those in dumps searchable through a `context_lookup` tool.

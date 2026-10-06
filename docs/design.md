@@ -5,14 +5,14 @@
 `session_before_compact` intercepts automatic compaction, `/compact`, and overflow
 recovery. The extension:
 
-1. Writes the current branch to a transcript dump.
-2. Prunes older dumps whose indexed entries are all present in the new dump.
-3. Carries forward read/modified file lists from earlier verbatim compactions.
-4. Removes thinking and tool results from the messages Pi selected for compaction.
-5. Builds and returns the deterministic checkpoint.
+1. Carries forward read/modified file lists from earlier verbatim compactions.
+2. Removes thinking and tool results from the messages Pi selected for compaction.
+3. Builds and returns a deterministic checkpoint, with compact tool signatures.
 
-If dumping or checkpoint construction fails, the hook returns no replacement and
-Pi falls back to its normal compaction. Pruning failures only produce a warning.
+No model call, transcript write, or dump pruning occurs in the hook. Pi retains
+the raw branch and persists the returned compaction entry through its normal
+session machinery. If checkpoint construction fails, the hook returns no
+replacement and Pi falls back to its normal compaction.
 
 Pi selects the kept boundary before the hook runs. The extension does not change
 `firstKeptEntryId` or Pi's `keepRecentTokens` setting. Recent messages remain
@@ -20,25 +20,24 @@ verbatim; the checkpoint describes the earlier portion.
 
 ## Flat spans and inherited summaries
 
-Each verbatim compaction stores its own uncapped lines in `details.span`, with
-its trigger, timestamp, and summarized message time range. Later checkpoints
-render the available spans oldest-first inside `<compacted-span>` blocks.
+Each compaction stores its own uncapped lines in `details.span`, with its trigger,
+timestamp, and summarized message time range. Later checkpoints render spans
+oldest-first inside `<compacted-span>` blocks. Consecutive preparation spans also
+include the preceding compaction's retained tail, avoiding gaps and duplication.
 
 The most recent compaction without span details becomes an opaque
 `<compacted-base>` block. This supports switching from a model-generated summary
 or a legacy verbatim checkpoint. Spans before that base are not re-rendered.
 
-The rendered checkpoint can be trimmed without changing the original span data
-or the transcript dump. Historical summaries are not evidence of current file
-contents or test state.
+Trimming the rendered checkpoint does not alter original span data or raw session
+entries. Historical summaries are not evidence of current file contents or test
+state. Read and modified file lists are carried forward explicitly because Pi
+does not automatically carry these lists from extension-provided compactions.
 
-Read and modified file lists are carried forward explicitly because Pi does not
-automatically carry these lists from extension-provided compactions.
-
-The rendered layout has one invariant: the closing line ("Conversation from …
-onward continues verbatim below") is the last line of the checkpoint. The file
-lists describe the compacted spans and therefore sit above it, so everything
-after the closing line is Pi's retained verbatim tail.
+The closing line ("Conversation from … onward continues verbatim below") is the
+last line of the checkpoint. File lists describe compacted spans and sit above
+it; everything after that line is Pi's retained verbatim tail. Generated recovery
+instructions contain no filesystem path to the transcript.
 
 ## Size guard
 
@@ -53,108 +52,95 @@ When span content exceeds the available budget, the extension:
 
 The implementation accounts for section/tag overhead before capping lines, but
 retains a minimum line budget of 500 characters. The inherited base summary is
-not capped. Instructions, file lists, and other checkpoint text also sit outside
-the line budget. Consequently this setting is a size guard, not a strict upper
-bound on either the total checkpoint or, in these exceptional cases, the
-conversation section.
+not capped. Instructions, file lists, and other checkpoint text sit outside the
+conversation section. This is a size guard, not a strict upper bound on the total
+checkpoint or, in these exceptional cases, the conversation section.
 
-For a model with limited context, reduce this value and leave room for Pi's
-verbatim tail, system prompt, tools, and subsequent work. The extension does not
-calculate a model-specific optimal budget.
+For limited context, reduce this value and leave room for Pi's verbatim tail,
+system prompt, tools, and subsequent work. The extension does not calculate a
+model-specific optimal budget.
 
-## Dump format and fidelity
+## Lookup source and transcript fidelity
 
-`conversation.md` is a readable serialization of the branch. Assistant sections
-are marked `[thinking]`, `[text]`, and `[toolCall]`. Thinking, prose, tool arguments,
-and textual tool outputs are not truncated by the dump writer.
+Pi's append-only session is the recovery store. Compaction adds a summary entry;
+it does not delete earlier messages. `context_lookup` calls
+`ctx.sessionManager.getBranch()` at lookup time to obtain the full raw history.
+It does not use `buildSessionContext()`, which projects the compacted model
+context. Context edits likewise leave original entries available in raw history.
 
-`meta.json` indexes entry start/end lines and assistant section boundaries.
-Lookup attribution uses this index rather than trusting header-like text inside
-the transcript. Pre-index dumps use a scanning fallback.
+The active branch is searched, including all of its compactions. Other branches
+and other sessions are not scanned. A fork can recover the history copied into
+its own branch. In-memory sessions work while the process lives; no disk file is
+required. No pre-task snapshot is needed.
+
+The renderer creates a readable transcript and entry/section index in memory.
+Each entry has an `ENTRY` header. Assistant sections are marked `[thinking]`,
+`[text]`, and `[toolCall]`. Thinking, prose, tool arguments, and textual tool
+outputs are untruncated in this representation. Array elements are physical
+lines, so index positions map consistently to line numbers.
+
+Lookup attribution and entry boundaries use the authoritative index, never
+header-like text or rules inside transcript content. The subagent sees the
+logical transcript name `session`, not a source filesystem path. Its tools
+search the in-memory lines directly, so there is no temporary file or cleanup.
 
 This is not a byte-for-byte session export. Images are represented by attachment
 notes rather than binary content; system prompt checkpoint text and some
-non-conversation metadata are not inlined. Pi's session JSONL remains the source
-for those fields.
+non-conversation metadata are not inlined. Pi's session JSONL is the source for
+those fields. Individual tool results are bounded even though the backing
+transcript is complete.
 
-## Dump location and git-ignore warning
+## Optional session-file override
 
-By default dumps are written to `<project>/.pi/context-dumps/`. The environment
-variable `MECH_COMPACT_DUMP_DIR` replaces that root with an absolute path (for
-example `~/.pi/context-dumps`), useful where the project tree is versioned and
-the dump location cannot be ignored. Relative values are rejected with a
-warning and the default root is used. Writes, pruning, and lookup all resolve
-the same root, so an override is consistent across the extension. Session
-ownership and pruning are keyed on entry ids, not directories, so a root shared
-by several projects keeps foreign sessions' dumps out of lookups and never
-prunes across sessions.
+`MECH_COMPACT_LOOKUP_SESSION_FILE` replaces the current branch with the branch
+from a specified absolute session JSONL path. This supports harnesses that run
+on a pruned fork but retain a full session separately. Ordinary use leaves it
+unset. It is not a model-supplied tool parameter.
 
-Because dumps can contain credentials and conversation text, the extension
-checks git state when it writes a dump: if the dump root is inside a git
-worktree and `git check-ignore` reports the location as not ignored, it emits
-one warning per process per dump root, suggesting a `.gitignore` entry or
-`MECH_COMPACT_DUMP_DIR`. Roots outside the project (an explicit override),
-non-git directories, and ignored locations produce no warning. Git failures
-time out after three seconds and are treated as "nothing to warn about"; the
-check never blocks or fails the dump. `MECH_COMPACT_WARN_GITIGNORE` set to a
-falsy value (`0`, `off`, `no`, `false`) disables the warning entirely; the
-dump itself is unaffected either way.
-
-## Ownership and pruning
-
-Indexed dumps belong to the current session history when they contain its
-branch's first entry ID. Pre-index dumps fall back to matching the session file;
-without a session file they are excluded from automatic selection.
-
-Forks copy entry IDs, so they can see their parent's history. An explicit dump
-name or absolute path deliberately bypasses automatic ownership filtering.
-
-A candidate dump is pruned only if:
-
-- It belongs to the session's history.
-- Its metadata contains a non-empty entry index.
-- Every indexed entry ID occurs in the new dump.
-- Its resolved path is inside the dump root and is not the newly written dump.
-
-Abandoned-branch dumps, foreign dumps, pre-index dumps, and unreadable metadata
-are retained. Informational `previous dump:` paths inside a later transcript may
-refer to a pruned directory.
+Each lookup checks the environment variable, validates an absolute path and a
+non-empty file, then calls `SessionManager.open(file).getBranch()`. The guards
+prevent Pi from initializing a missing or empty source. Opening a legacy session
+can perform Pi's normal migration. Invalid overrides fail explicitly; there is
+no fallback to the current/pruned branch. No ownership matching or dump selection
+is involved.
 
 ## Lookup subagent
 
 `context_lookup` constructs a separate model conversation with three tools:
 
 - `list_entries`: list entry headers and previews.
-- `grep`: search transcript lines with surrounding context and entry attribution.
+- `grep`: regex-search lines with surrounding context and entry attribution.
 - `show_entry`: retrieve an indexed entry block.
 
 The default model is the session model. An optional `provider/modelId` can select
-another registered model. An unresolved configured model currently falls back
-to the session model. No separate process, loaded model, or external subagent
-extension is required.
+another registered model. An unresolved configured model falls back to the
+session model. No separate process, loaded model, or external subagent extension
+is required.
 
 The default budget is ten search turns, with up to 4,096 output tokens per model
-call. One additional tool-free call is used when the search budget is exhausted,
-asking for partial findings. If it fails or returns no text, the latest assistant
-text is returned with an incomplete-findings marker. Search responses and final
-answers have character guards to limit returned content.
+call. Exhaustion adds one tool-free call asking for partial findings. If that call
+fails or returns no text, the latest assistant text is returned with an
+incomplete-findings marker. Search responses and final answers have character
+guards. Cancellation is passed through to model calls.
 
-Findings should identify user instructions, observed tool output, and historical
-reasoning separately. A past observation is not proof of current state. Lookup
-success still depends on model behavior, query scope, and tool-output limits.
+Findings should distinguish user instructions, observed tool output, and
+historical reasoning. A past observation is not proof of current state. Recovery
+still depends on model behavior, query scope, and output limits. Only final
+findings reach the main agent; intermediate searches do not enter its context.
 
-The lookup conversation does not inherit the main agent's skill inventory. Its
-instructions are supplied directly by the extension. The main agent's bundled
-skill is complementary guidance, not a required lookup runtime component.
+The subagent does not inherit the main agent's skill inventory. Its instructions
+come directly from the extension. The bundled skill supplies complementary
+workflow guidance, not a required lookup runtime component.
 
-## Configuration and scope
+## Configuration and compatibility
 
-The three supported settings are environment variables read at extension load.
-There is no extension-specific JSON configuration or automatic `.env` loading.
-Pi's normal compaction settings still control when compaction occurs and how much
-recent context is retained.
+Model selection, turn budget, and size guard are read at extension load. The
+session-file override is read at lookup time. There is no extension-specific JSON
+configuration or automatic `.env` loading. Pi's own compaction settings control
+when compaction occurs and how much recent context is retained.
 
-The release contains only verbatim compaction. Experiment arm switches,
-custom model-summary prompts, and dump-root overrides are not included.
-
-`/tree` branch summarization is not intercepted.
+`dump_context`, `/dump-context`, and `dumpDir` are not exposed. Old dump roots and
+git-ignore warning settings are unused; existing dump files are not read, pruned,
+or deleted. Upgrade the extension and skill together to remove obsolete snapshot
+instructions. The release has no experiment arm switches or custom model-summary
+prompts. `/tree` branch summarization is not intercepted.

@@ -2,20 +2,24 @@
 
 ## Unreleased — initial release preparation
 
-- Deterministic compaction checkpoints retain user messages and assistant prose,
-  subject to a size guard; thinking and tool outputs remain recoverable in dumps.
-- Flat, chronological spans avoid repeatedly summarizing earlier facts.
-- Entry-indexed transcript dumps support attributed lookup results.
-- Session-scoped lookup and containment-based pruning preserve abandoned branches.
-- `context_lookup` uses a subagent with list, grep, and entry-retrieval tools.
-- Exhausted lookups receive one final tool-free write-up of partial findings.
+- Deterministic checkpoints retain user messages and assistant prose, subject to
+  a size guard; thinking, full tool outputs, and arguments remain in Pi's session.
+- Flat chronological spans avoid repeatedly summarizing earlier facts.
+- Session-backed `context_lookup` searches the full raw active branch across all
+  compactions, using an in-memory transcript with authoritative entry attribution.
+- No local transcript dump, temporary file, ownership matching, or pruning.
+- Optional `MECH_COMPACT_LOOKUP_SESSION_FILE` supports full-session recovery from
+  pruned harness forks, with explicit failures for invalid overrides.
+- Subagent lookup provides list, grep, and entry-retrieval tools; exhausted lookups
+  receive one final tool-free write-up of partial findings.
 - Default conversation-section budget: 80,000 characters.
-- On-demand `/dump-context` command and `dump_context` tool.
-- `MECH_COMPACT_DUMP_DIR` moves the dump root outside the project tree
-  (absolute path required).
-- One-time warning when dumps land in a git worktree that does not ignore
-  them; `MECH_COMPACT_WARN_GITIGNORE=0` disables the warning.
-- Bundled `context-retrieval` skill, including narrowly scoped evidence-recovery guidance.
-- Preliminary synthetic pilot results, with limitations and exclusions documented.
+- Removed `/dump-context`, `dump_context`, and the `dumpDir` lookup argument;
+  old dump-directory and git-ignore warning settings are unused.
+- Bundled `context-retrieval` skill describes session-backed evidence recovery,
+  branch scope, historical provenance, and re-verification after compaction.
+- Deterministic tests cover session recovery, overrides, attribution, size guards,
+  the skill, and Pi's real package loader.
+- Preliminary synthetic pilot figures are preserved as historical results from
+  the dump-based implementation, not measurements of the current implementation.
 
 No version has been published from this staging directory. Full evaluation is pending.
