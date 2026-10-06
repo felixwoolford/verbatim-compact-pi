@@ -25,12 +25,16 @@ const text = (value) => ({ type: "text", text: value });
 const response = (content, stopReason = "stop") => assistant(content, stopReason);
 const toolText = (result) => result.content.map((b) => b.text ?? "").join("");
 
-function load(factory) {
+function load(factory, sessionRef) {
   const handlers = {}, tools = {}, commands = {};
   factory({
     on: (name, handler) => { handlers[name] = handler; },
     registerTool: (tool) => { tools[tool.name] = tool; },
     registerCommand: (name, command) => { commands[name] = command; },
+    appendEntry: (type, data) => {
+      assert(sessionRef?.current, "state writes must target the bound session");
+      sessionRef.current.appendCustomEntry(type, data);
+    },
   });
   return { handlers, tools, commands };
 }
@@ -118,6 +122,167 @@ function saveSession(manager, file) {
   fs.writeFileSync(file, [manager.getHeader(), ...manager.getEntries()].map((e) => JSON.stringify(e)).join("\n") + "\n");
 }
 
+async function methodTests(factory, SessionManager, root) {
+  console.log("== Compaction method: persistence, all triggers, autocomplete, and mixed guarantees ==");
+  const cwd = path.join(root, "method-project");
+  fs.mkdirSync(cwd);
+  const f = fixture(SessionManager, cwd);
+  const sessionRef = { current: f.manager };
+  const ext = load(factory, sessionRef);
+  const notices = [];
+  let wrap;
+  const ctx = { ...makeContext(f.manager, cwd), mode: "tui", hasUI: true, ui: {
+    notify: (message, level) => notices.push({ message, level }),
+    addAutocompleteProvider: (factory) => { wrap = factory; },
+  } };
+  await ext.handlers.session_start({ reason: "startup" }, ctx);
+  assert.equal(notices.length, 0, "fresh verbatim session needs no warning");
+  const command = ext.commands["compaction-method"];
+  assert.deepEqual(command.getArgumentCompletions("d").map((item) => item.value), ["default"]);
+  assert.deepEqual(command.getArgumentCompletions("v").map((item) => item.value), ["verbatim"]);
+  const before = f.manager.getLeafId();
+  await command.handler("", ctx);
+  assert(notices.at(-1).message.includes("method: verbatim"));
+  for (const arg of ["invalid", "d", "v"]) {
+    await command.handler(arg, ctx);
+    assert.equal(notices.at(-1).level, "error", `${arg} is not an accepted method`);
+  }
+  assert.equal(f.manager.getLeafId(), before, "query and invalid input do not persist anything");
+
+  const original = { prefix: "/comp", items: [
+    { value: "compact", label: "compact", description: "Original description" },
+    { value: "compaction-method", label: "compaction-method", description: "Other command" },
+  ] };
+  let suggestions = original;
+  let forwarded;
+  const completion = { lines: ["/compact "], cursorLine: 0, cursorCol: 9 };
+  const current = {
+    triggerCharacters: ["#"],
+    async getSuggestions(...args) { forwarded = args; return suggestions; },
+    applyCompletion: (...args) => { forwarded = args; return completion; },
+    shouldTriggerFileCompletion: (...args) => { forwarded = args; return false; },
+  };
+  const provider = wrap(current);
+  const options = { signal: new AbortController().signal, force: false };
+  const suggest = () => provider.getSuggestions(["/comp"], 0, 5, options);
+  assert.equal((await suggest()).items[0].description, "Manually compact with verbatim-compact");
+  assert.deepEqual(forwarded, [["/comp"], 0, 5, options]);
+  assert.deepEqual(provider.triggerCharacters, ["#"]);
+  assert.equal(provider.applyCompletion(["/comp"], 0, 5, original.items[0], "/comp"), completion);
+  assert.equal(provider.shouldTriggerFileCompletion(["/comp"], 0, 5), false);
+  assert.equal(wrap({ ...current, shouldTriggerFileCompletion: undefined }).shouldTriggerFileCompletion([], 0, 0), true);
+  assert.equal(original.items[0].description, "Original description", "no mutation of built-in metadata");
+  assert.equal((await suggest()).items[1], original.items[1], "other commands are untouched");
+  suggestions = { ...original, prefix: "compact" };
+  assert.equal(await suggest(), suggestions, "file completions are untouched");
+  suggestions = { ...original, prefix: "/compact arg" };
+  assert.equal(await suggest(), suggestions, "argument completions are untouched");
+  suggestions = null;
+  assert.equal(await suggest(), null);
+  suggestions = original;
+  const { CombinedAutocompleteProvider } = await jiti.import(path.join(piRoot,
+    "node_modules/@earendil-works/pi-tui/dist/autocomplete.js"));
+  const realProvider = wrap(new CombinedAutocompleteProvider([
+    { name: "compact", description: "Manually compact the session context" },
+    { name: "compaction-method", description: "Select method" },
+  ], cwd));
+  const realDescription = async () => (await realProvider.getSuggestions(["/comp"], 0, 5, options))
+    .items.find((item) => item.value === "compact").description;
+  assert.equal(await realDescription(), "Manually compact with verbatim-compact");
+
+  const originalContext = JSON.stringify(f.manager.buildSessionContext());
+  await command.handler("default", ctx);
+  assert(notices.some((n) => n.level === "warning" && n.message.includes("Applying default compaction weakens the verbatim guarantee")));
+  assert(notices.at(-1).message.includes("before default compaction runs leaves the guarantee unchanged"));
+  notices.length = 0;
+  await command.handler("verbatim", ctx);
+  assert(notices.at(-1).message.includes("method: verbatim"));
+  assert(notices.every((n) => n.level === "info"), "switching back before compaction has no mixed-context warning");
+  assert.equal(JSON.stringify(f.manager.buildSessionContext()), originalContext, "changing the method alone never changes active model context");
+  await command.handler("default", ctx);
+  assert.equal(notices.at(-1).level, "warning", "an actual switch warns");
+  const defaultLeaf = f.manager.getLeafId();
+  notices.length = 0;
+  await command.handler("", ctx);
+  await command.handler("default", ctx);
+  assert(notices.every((n) => n.level === "info"), "checks and reselecting default do not warn");
+  assert.equal(f.manager.getLeafId(), defaultLeaf, "checking and reselecting a method do not duplicate state");
+  notices.length = 0;
+  assert.equal((await suggest()).items[0].description, "Manually compact with default compaction");
+  assert.equal(await realDescription(), "Manually compact with default compaction");
+  for (const enabled of [false, true]) {
+    for (const reason of ["manual", "threshold", "overflow"]) {
+      const preparation = { messagesToSummarize: [f.manager.getEntry(f.u).message], turnPrefixMessages: [],
+        settings: { enabled }, firstKeptEntryId: f.kept, customInstructions: "preserve topic" };
+      const previous = JSON.stringify(preparation);
+      const result = await ext.handlers.session_before_compact({ preparation, branchEntries: f.manager.getBranch(),
+        reason, customInstructions: "preserve topic", signal: new AbortController().signal }, ctx);
+      assert.equal(result, undefined, `default defers to Pi for ${reason}, auto=${enabled}`);
+      assert.equal(JSON.stringify(preparation), previous, "Pi preparation is not modified");
+      assert.equal(f.manager.getLeafId(), defaultLeaf, "default pass-through has no state writes");
+    }
+  }
+  assert.equal(notices.length, 0, "running default compaction does not repeat the setting-switch warning");
+  const saved = path.join(root, "method-session.jsonl");
+  saveSession(f.manager, saved);
+  const forked = SessionManager.forkFrom(saved, cwd, path.join(root, "forked-sessions"));
+  sessionRef.current = forked;
+  const forkExt = load(factory, sessionRef);
+  await forkExt.commands["compaction-method"].handler("", { ...ctx, sessionManager: forked });
+  assert(notices.at(-1).message.includes("method: default"), "fork inherits the copied branch's method");
+  const reopened = SessionManager.open(saved);
+  sessionRef.current = reopened;
+  const resumedCtx = { ...ctx, sessionManager: reopened };
+  const resumed = load(factory, sessionRef);
+  await resumed.handlers.session_start({ reason: "resume" }, resumedCtx);
+  await resumed.commands["compaction-method"].handler("", resumedCtx);
+  assert(notices.at(-1).message.includes("method: default"), "selection survives session-file reopening and reload");
+  assert.equal((await wrap(current).getSuggestions(["/comp"], 0, 5, options)).items[0].description,
+    "Manually compact with default compaction");
+  await resumed.handlers.session_start({ reason: "reload" }, { ...resumedCtx, ui: { notify: ctx.ui.notify } });
+  await resumed.handlers.session_start({ reason: "startup" }, { ...resumedCtx, mode: "rpc", ui: {
+    notify: ctx.ui.notify, addAutocompleteProvider: () => assert.fail("RPC must not install UI autocomplete"),
+  } });
+
+  assert(notices.every((n) => n.level === "info"), "resume, fork, reload, and checks do not repeat the default warning");
+  sessionRef.current = f.manager;
+  f.manager.branch(before);
+  assert.equal((await suggest()).items[0].description, "Manually compact with verbatim-compact",
+    "tree navigation reads the active branch, not abandoned state");
+  const live = f.manager.appendMessage(user("New live branch"));
+  await compact(ext, ctx, [f.u], live);
+  f.manager.branch(defaultLeaf);
+  assert.equal((await suggest()).items[0].description, "Manually compact with default compaction");
+
+  // Simulate Pi's successful default compaction, then switch back. The opaque
+  // base stays a summary; new spans and the retained tail remain verbatim.
+  f.manager.appendCompaction("MODEL_SUMMARY_BASE", f.kept, 1000);
+  notices.length = 0;
+  await command.handler("verbatim", ctx);
+  assert(notices.some((n) => n.level === "warning" && n.message.includes("Mixed context")));
+  notices.length = 0;
+  await command.handler("", ctx);
+  assert(notices.every((n) => n.level === "info"), "mixed-context status checks also do not warn");
+  const tail = f.manager.appendMessage(user("Tail after summary", epoch + 2000));
+  const mixed = await compact(ext, ctx, [f.kept], tail);
+  assert(mixed.summary.includes("**Mixed context: earlier material is model-summarized, not verbatim.**"));
+  assert(mixed.summary.includes("guarantee applies only to the labelled verbatim spans and uncompacted tail"));
+  assert.equal(mixed.summary.split("MODEL_SUMMARY_BASE").length - 1, 1);
+  assert(mixed.summary.indexOf("Mixed context") < mixed.summary.indexOf("### Compacted conversation"));
+  const nextTail = f.manager.appendMessage(user("Next mixed tail", epoch + 3000));
+  const mixedAgain = await compact(ext, ctx, [tail], nextTail, "overflow");
+  assert(mixedAgain.summary.includes("Mixed context"), "warning survives subsequent verbatim compactions");
+  await search(ext, ctx, [toolCall("show_entry", { id: f.t })], ([result]) => assert(result.includes(output)));
+
+  const other = SessionManager.inMemory(cwd);
+  sessionRef.current = other;
+  notices.length = 0;
+  await command.handler("", { ...ctx, sessionManager: other });
+  assert(notices.at(-1).message.includes("method: verbatim"), "new sessions do not inherit other sessions' methods");
+  assert(!other.getEntries().length);
+  assert.deepEqual(fs.readdirSync(cwd), [], "method selection and lookup require no extra files or footer");
+}
+
 async function capTests(ext, SessionManager, root, budget) {
   const cwd = path.join(root, "cap-project");
   fs.mkdirSync(cwd);
@@ -163,6 +328,7 @@ async function checkpointTests(ext, SessionManager, root) {
   const kept = manager.appendMessage(user("Retained after model base", epoch + 2000));
   const c = await compact(ext, ctx, [tail], kept);
   assert(c.summary.includes('<compacted-base kind="model-summary"'));
+  assert(c.summary.includes("Mixed context"));
   assert.equal((c.summary.match(/MODEL_BASE_EXACT_TEXT/g) ?? []).length, 1);
   assert(!c.summary.includes("BEFORE_MODEL_BASE"), "pre-base spans are not re-rendered");
   assert.equal((c.summary.match(/<compacted-span /g) ?? []).length, 1);
@@ -176,6 +342,7 @@ async function checkpointTests(ext, SessionManager, root) {
   const legacyKept = legacy.appendMessage(user("Next legacy tail", epoch + 1000));
   const legacyResult = await compact(ext, makeContext(legacy, cwd), [oldTail], legacyKept);
   assert(legacyResult.summary.includes('<compacted-base kind="legacy-checkpoint"'));
+  assert(!legacyResult.summary.includes("Mixed context"), "legacy verbatim base is not mislabelled as model-summarized");
   assert.equal((legacyResult.summary.match(/LEGACY_CHECKPOINT_EXACT_TEXT/g) ?? []).length, 1);
   assert.deepEqual(legacyResult.details.readFiles, ["legacy-read.ts"]);
   assert.deepEqual(legacyResult.details.modifiedFiles, ["legacy-edited.ts"]);
@@ -246,7 +413,8 @@ async function main() {
       return;
     }
     assert.deepEqual(Object.keys(ext.tools), ["context_lookup"]);
-    assert.deepEqual(Object.keys(ext.commands), []);
+    assert.deepEqual(Object.keys(ext.commands), ["compaction-method"]);
+    await methodTests(factory, SessionManager, root);
     assert.deepEqual(Object.keys(ext.tools.context_lookup.parameters.properties), ["question"]);
     assert(!ext.tools.context_lookup.description.includes(".pi/context-dumps"));
 

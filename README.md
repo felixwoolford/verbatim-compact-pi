@@ -1,11 +1,11 @@
 # verbatim-compact
 
 Deterministic context compaction for [Pi](https://pi.dev/), with session-backed
-recovery. Replaces Pi's model-generated compaction summary with a checkpoint
+recovery. By default, replaces Pi's model-generated compaction summary with a checkpoint
 built mechanically from conversation text. Thinking and tool outputs are removed
 from the active model context, while user inputs, assistant text, and tool call stubs are retained verbatim.
 
-Compaction itself makes no model call. When a
+Verbatim compaction itself makes no model call. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
@@ -13,7 +13,9 @@ The goal is to let the agent withstand ~8 compactions without the copy-of-a-copy
 
 The defining property of verbatim-compact is the guarantee that all history is either kept
 verbatim in context or stripped entirely from it; nothing is ever compressed in
-between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and what remaining information must be verified before being relied on.
+between. This guarantee applies to verbatim spans and the uncompacted tail, not
+an inherited model-generated summary. Default compaction is an explicit opt-in
+that weakens this guarantee (see [Usage](#usage)). Every verbatim compaction is also followed by a re-orientation block that tells the agent what was removed and what remaining information must be verified before being relied on.
 Tests indicate that this helps weaker models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The primary intended use case is on a strong local LLM with a reasonably large context window (128k+) : for example, **Qwen 3.8 27B through
@@ -73,12 +75,50 @@ Pi's existing session files are unaffected.
 
 ## Usage
 
-Pi's automatic compaction uses verbatim-compact once the extension is loaded.
+Pi's compaction uses verbatim-compact by default once the extension is loaded.
 To compact manually:
 
 ```text
 /compact
 ```
+
+### Select the compaction method
+
+```text
+/compaction-method
+/compaction-method default
+/compaction-method verbatim
+```
+
+With no argument, the command reports
+the current method. A default-mode warning appears when
+actually switching to default, but not on repeated selections, resume, or compaction.
+The choice applies to
+manual `/compact`, automatic threshold compaction, and context-overflow recovery.
+
+The choice persists in the existing session, follows branch history through
+reload, resume, fork, and tree navigation, and needs no extra configuration file.
+New sessions default to verbatim. The footer is unchanged. On Pi versions with
+`addAutocompleteProvider`, `/compact`'s description changes to “Manually compact
+with verbatim-compact” or “Manually compact with default compaction”; older
+versions retain the built-in description. The `/compact` command itself is not
+replaced, and Pi handles custom summary instructions normally in default mode.
+
+> **Applying default compaction weakens the verbatim guarantee.** Changing this
+> setting does not alter active context; switching back to verbatim before default
+> compaction runs leaves the guarantee unchanged. If default compaction runs
+> (manually or automatically), it replaces older active context with a
+> model-generated summary, which may omit or reinterpret details. Switching back
+> afterward does not undo this: only subsequent verbatim spans retain the
+> guarantee. Original history remains recoverable through `context_lookup`, but
+> is no longer directly present in active context.
+
+Later verbatim checkpoints containing a model-summary base prominently warn:
+**Mixed context: earlier material is model-summarized, not verbatim.** The
+verbatim guarantee applies only to the labelled verbatim spans and uncompacted
+tail—not to the opaque summary base.
+
+### Recover historical details
 
 The extension registers one model-callable tool:
 
@@ -149,8 +189,8 @@ When lookups use the session model on a local server, they share its KV cache wi
 
 ### Deterministic checkpoint
 
-Pi selects the compacted messages and retained boundary. The extension builds a
-checkpoint without changing that boundary or calling a model:
+Pi selects the compacted messages and retained boundary. In verbatim mode, the
+extension builds a checkpoint without changing that boundary or calling a model:
 
 | Content | Treatment |
 |---|---|

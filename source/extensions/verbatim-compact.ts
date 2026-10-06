@@ -33,6 +33,23 @@ import type { ExtensionAPI, ModelRegistry, SessionEntry } from "@earendil-works/
 // ============================================================================
 
 const MECH_KIND = "mech-compact";
+const METHOD_ENTRY = "verbatim-compact:compaction-method";
+type CompactionMethod = "verbatim" | "default";
+
+const DEFAULT_COMPACTION_WARNING = "Applying default compaction weakens the verbatim guarantee. You may switch back to verbatim compaction before default compaction runs to leave the guarantee unchanged. If default compaction runs (manually or automatically), it replaces older active context with a model-generated summary, which may omit or reinterpret details. Switching back afterward does not undo this: only subsequent verbatim spans retain the guarantee. Original history remains recoverable through context_lookup, but is no longer a direct expansion of the active context.";
+const MIXED_CONTEXT_WARNING = "**Mixed context: earlier material is model-summarized, not verbatim.** The verbatim guarantee applies only to the labelled verbatim spans and uncompacted tail. The model-summary base may omit or reinterpret details; use `context_lookup` to recover original history.";
+
+// Read from the active branch rather than cached state: reload, resume, fork,
+// and tree navigation all inherit only the choices on their own path.
+function compactionMethod(entries: SessionEntry[]): CompactionMethod {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "custom" || entry.customType !== METHOD_ENTRY) continue;
+    const method = (entry.data as { method?: unknown } | undefined)?.method;
+    if (method === "verbatim" || method === "default") return method;
+  }
+  return "verbatim";
+}
 
 function intFromEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -496,6 +513,10 @@ function buildMechanicalSummary(opts: {
   const compactionCount = opts.branchEntries.filter((e) => e.type === "compaction").length + 1;
   const parts: string[] = [];
   parts.push(`## Verbatim compaction checkpoint (compaction ${compactionCount} on this branch)`);
+  if (base?.kind === "model-summary") {
+    parts.push(MIXED_CONTEXT_WARNING);
+    opts.notify(MIXED_CONTEXT_WARNING);
+  }
   parts.push(`- Latest: ${opts.now} (trigger: ${opts.reason}, ~${opts.tokensBefore.toLocaleString()} tokens before compaction)`);
   parts.push("- In the compacted spans, user and assistant prose is kept verbatim, subject to budget trimming; tool calls are kept as one-line signatures (arguments truncated). Assistant thinking and tool outputs are removed. Retained prose is a record of what was said, not verification of its claims.");
   parts.push(
@@ -800,6 +821,58 @@ function sessionTranscript(ctx: { sessionManager: { getBranch: () => SessionEntr
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
+  // Method selection never changes Pi's auto-compaction enabled setting.
+  pi.registerCommand("compaction-method", {
+    description: "Show or set the session compaction method: verbatim|default (manual and automatic)",
+    getArgumentCompletions: (prefix) => ["verbatim", "default"]
+      .filter((method) => method.startsWith(prefix))
+      .map((method) => ({ value: method, label: method })),
+    handler: async (args, ctx) => {
+      const requested = args.trim();
+      if (requested && requested !== "verbatim" && requested !== "default") {
+        ctx.ui.notify("Usage: /compaction-method [verbatim|default]", "error");
+        return;
+      }
+      const entries = ctx.sessionManager.getBranch();
+      const previous = compactionMethod(entries);
+      const method = requested || previous;
+      const changed = method !== previous;
+      if (changed) pi.appendEntry(METHOD_ENTRY, { method });
+      ctx.ui.notify(`Compaction method: ${method} (manual, automatic, and overflow recovery). Auto-compaction on/off is unchanged.`, "info");
+      if (changed && method === "default") ctx.ui.notify(DEFAULT_COMPACTION_WARNING, "warning");
+      else if (changed && collectBaseAndSpans(entries).base?.kind === "model-summary") ctx.ui.notify(MIXED_CONTEXT_WARNING, "warning");
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    const entries = ctx.sessionManager.getBranch();
+    if (compactionMethod(entries) === "verbatim" && collectBaseAndSpans(entries).base?.kind === "model-summary") {
+      ctx.ui.notify(MIXED_CONTEXT_WARNING, "warning");
+    }
+
+    // Amend the built-in command's autocomplete description, not its handler.
+    // Older Pi versions without this API keep their original description.
+    if (ctx.mode !== "tui" || typeof ctx.ui.addAutocompleteProvider !== "function") return;
+    ctx.ui.addAutocompleteProvider((current) => ({
+      get triggerCharacters() { return current.triggerCharacters; },
+      async getSuggestions(lines, cursorLine, cursorCol, options) {
+        const suggestions = await current.getSuggestions(lines, cursorLine, cursorCol, options);
+        if (!suggestions || !/^\/\S*$/.test(suggestions.prefix)) return suggestions;
+        const method = compactionMethod(ctx.sessionManager.getBranch());
+        return {
+          ...suggestions,
+          items: suggestions.items.map((item) => item.value === "compact"
+            ? { ...item, description: method === "verbatim"
+              ? "Manually compact with verbatim-compact"
+              : "Manually compact with default compaction" }
+            : item),
+        };
+      },
+      applyCompletion: (...args) => current.applyCompletion(...args),
+      shouldTriggerFileCompletion: (...args) => current.shouldTriggerFileCompletion?.(...args) ?? true,
+    }));
+  });
+
   // --------------------------------------------------------------------------
   // Mechanical compaction
   // --------------------------------------------------------------------------
@@ -808,6 +881,9 @@ export default function (pi: ExtensionAPI) {
     if (!preparation) return;
     if (signal?.aborted) return;
     if (preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0) return;
+    if (compactionMethod(ctx.sessionManager.getBranch()) === "default") {
+      return; // No override: Pi runs its normal model-generated compaction.
+    }
 
     // No disk snapshot: pi retains the full raw branch in its session.
 

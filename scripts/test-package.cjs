@@ -49,7 +49,7 @@ async function main() {
     assert.equal(loaded.extensions.length, 1);
     const extension = loaded.extensions[0];
     assert.deepEqual([...extension.tools.keys()], ["context_lookup"], "only the session lookup tool is registered");
-    assert.equal(extension.commands.size, 0, "no dump command is registered");
+    assert.deepEqual([...extension.commands.keys()], ["compaction-method"], "method selection is registered, with no dump or replacement compact command");
     const lookup = extension.tools.get("context_lookup");
     assert.deepEqual(Object.keys(lookup.definition.parameters.properties), ["question"], "lookup has no dump-selection argument");
     const skills = loadSkills({ cwd: root, agentDir: temp, skillPaths, includeDefaults: false });
