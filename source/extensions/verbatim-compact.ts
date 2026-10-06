@@ -430,11 +430,11 @@ function capSpans(spans: string[][], budget: number): string[][] {
   return spans.map((_, span) => items.filter((it) => it.span === span).map((it) => it.line));
 }
 
-const REORIENT_BLOCK = `**Re-orient before continuing.** The dropped context contained the project's executed startup process. Re-run it now:
-1. Redo the startup process described in the project instructions in your system prompt (AGENTS.md / CLAUDE.md): read the files it points you to and run the checks it asks for. Its text is still in your context; the results of having followed it are not. If no such instructions are in your system prompt, skip this step.
-2. Run \`git status\` and review uncommitted work; re-verify build/test state if you are about to rely on it.
+const REORIENT_BLOCK = `**Re-orient before continuing.** Compaction may have removed information needed to follow the project instructions:
+1. Re-read documents required by the applicable instructions (such as files referenced by AGENTS.md / CLAUDE.md), even if you read them before compaction. Re-acquire any other information needed for the current task that is no longer in context. This means restoring inputs, not repeating completed work: do not redo writes, edits, or other state-changing actions merely because their results were dropped. If needed, recover those results with \`context_lookup\`, or verify current state.
+2. If this is a Git repository, run \`git status\` and review uncommitted work. Re-verify build/test state if you are about to rely on it.
 3. Re-read any file you are about to modify — do not trust content you only remember from before the compaction.
-4. **Treat other pre-compaction knowledge as unverified too.** Tool outputs were removed. Anything you know only from them — or from earlier assistant prose describing them — is a note, not evidence. Before you state it as fact or base a decision on it, re-read the source or ask \`context_lookup\`. If you cannot verify it, say explicitly that it is unverified.
+4. **Treat other pre-compaction knowledge as unverified too.** Thinking and tool outputs were removed. Anything you know only from them — or from earlier assistant prose describing them — is a note, not evidence. Before you state it as fact or base a decision on it, re-read the source or ask \`context_lookup\`. If you cannot verify it, say explicitly that it is unverified.
 
 **Recovering dropped details.** Information removed from your active context is preserved in the session. Use \`context_lookup\` to recover relevant details, including earlier thinking and tool outputs. Do NOT grep the session file yourself in this conversation — that would fill your context with raw transcript text. Call the \`context_lookup\` tool with a specific question; a subagent searches the session transcript in its own context and returns only the relevant findings.`;
 
@@ -497,7 +497,7 @@ function buildMechanicalSummary(opts: {
   const parts: string[] = [];
   parts.push(`## Verbatim compaction checkpoint (compaction ${compactionCount} on this branch)`);
   parts.push(`- Latest: ${opts.now} (trigger: ${opts.reason}, ~${opts.tokensBefore.toLocaleString()} tokens before compaction)`);
-  parts.push("- Kept: user messages verbatim, assistant text, tool calls as one-line signatures (arguments truncated). Removed: all assistant thinking and all tool outputs.");
+  parts.push("- In the compacted spans, user and assistant prose is kept verbatim, subject to budget trimming; tool calls are kept as one-line signatures (arguments truncated). Assistant thinking and tool outputs are removed. Retained prose is a record of what was said, not verification of its claims.");
   parts.push(
     "- pi keeps the most recent part of the conversation verbatim (its `keepRecentTokens` setting). The spans below cover only what came *before* that; everything after the last span is uncompacted.",
   );

@@ -69,6 +69,15 @@ async function compact(ext, ctx, ids, kept, reason = "manual", fileOps) {
   assert(!c.summary.includes(ctx.cwd), "checkpoint does not disclose the transcript path");
   assert(!c.summary.includes("see dump"));
   assert(c.summary.includes("kept in the session; use `context_lookup`"));
+  assert(c.summary.includes("Re-read documents required by the applicable instructions"));
+  assert(c.summary.includes("even if you read them before compaction."));
+  assert(c.summary.includes("This means restoring inputs, not repeating completed work: do not redo writes, edits, or other state-changing actions merely because their results were dropped."));
+  assert(c.summary.includes("If needed, recover those results with `context_lookup`, or verify current state."));
+  assert(!c.summary.includes("Redo the startup process"));
+  assert(c.summary.includes("user and assistant prose is kept verbatim, subject to budget trimming"));
+  assert(c.summary.includes("Retained prose is a record of what was said, not verification of its claims."));
+  assert(c.summary.includes("If this is a Git repository, run `git status`"));
+  assert(c.summary.includes("Thinking and tool outputs were removed."));
   assert(!c.summary.includes("EARLIEST_TOOL_OUTPUT"));
   assert(!c.summary.includes("EARLIEST_THINKING"));
   const id = ctx.sessionManager.appendCompaction(c.summary, kept, c.tokensBefore, c.details, true);
