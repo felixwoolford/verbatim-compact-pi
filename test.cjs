@@ -138,12 +138,12 @@ async function methodTests(factory, SessionManager, root) {
   await ext.handlers.session_start({ reason: "startup" }, ctx);
   assert.equal(notices.length, 0, "fresh verbatim session needs no warning");
   const command = ext.commands["compaction-method"];
-  assert.deepEqual(command.getArgumentCompletions("d").map((item) => item.value), ["default"]);
+  assert.deepEqual(command.getArgumentCompletions("s").map((item) => item.value), ["summary"]);
   assert.deepEqual(command.getArgumentCompletions("v").map((item) => item.value), ["verbatim"]);
   const before = f.manager.getLeafId();
   await command.handler("", ctx);
   assert(notices.at(-1).message.includes("method: verbatim"));
-  for (const arg of ["invalid", "d", "v"]) {
+  for (const arg of ["invalid", "default", "d", "v"]) {
     await command.handler(arg, ctx);
     assert.equal(notices.at(-1).level, "error", `${arg} is not an accepted method`);
   }
@@ -191,25 +191,27 @@ async function methodTests(factory, SessionManager, root) {
   assert.equal(await realDescription(), "Manually compact with verbatim-compact");
 
   const originalContext = JSON.stringify(f.manager.buildSessionContext());
-  await command.handler("default", ctx);
-  assert(notices.some((n) => n.level === "warning" && n.message.includes("Applying default compaction weakens the verbatim guarantee")));
-  assert(notices.at(-1).message.includes("before default compaction runs leaves the guarantee unchanged"));
+  await command.handler("summary", ctx);
+  assert(notices.some((n) => n.level === "warning" && n.message.includes("Applying summary compaction weakens the verbatim guarantee")));
+  assert(notices.at(-1).message.includes("before summary compaction runs to leave the guarantee unchanged"));
+  assert(!notices.at(-1).message.includes("default compaction"));
   notices.length = 0;
   await command.handler("verbatim", ctx);
   assert(notices.at(-1).message.includes("method: verbatim"));
   assert(notices.every((n) => n.level === "info"), "switching back before compaction has no mixed-context warning");
   assert.equal(JSON.stringify(f.manager.buildSessionContext()), originalContext, "changing the method alone never changes active model context");
-  await command.handler("default", ctx);
+  await command.handler("summary", ctx);
   assert.equal(notices.at(-1).level, "warning", "an actual switch warns");
-  const defaultLeaf = f.manager.getLeafId();
+  const summaryLeaf = f.manager.getLeafId();
+  assert.equal(f.manager.getEntry(summaryLeaf).data.method, "summary");
   notices.length = 0;
   await command.handler("", ctx);
-  await command.handler("default", ctx);
-  assert(notices.every((n) => n.level === "info"), "checks and reselecting default do not warn");
-  assert.equal(f.manager.getLeafId(), defaultLeaf, "checking and reselecting a method do not duplicate state");
+  await command.handler("summary", ctx);
+  assert(notices.every((n) => n.level === "info"), "checks and reselecting summary do not warn");
+  assert.equal(f.manager.getLeafId(), summaryLeaf, "checking and reselecting a method do not duplicate state");
   notices.length = 0;
-  assert.equal((await suggest()).items[0].description, "Manually compact with default compaction");
-  assert.equal(await realDescription(), "Manually compact with default compaction");
+  assert.equal((await suggest()).items[0].description, "Manually compact with summary compaction");
+  assert.equal(await realDescription(), "Manually compact with summary compaction");
   for (const enabled of [false, true]) {
     for (const reason of ["manual", "threshold", "overflow"]) {
       const preparation = { messagesToSummarize: [f.manager.getEntry(f.u).message], turnPrefixMessages: [],
@@ -217,44 +219,44 @@ async function methodTests(factory, SessionManager, root) {
       const previous = JSON.stringify(preparation);
       const result = await ext.handlers.session_before_compact({ preparation, branchEntries: f.manager.getBranch(),
         reason, customInstructions: "preserve topic", signal: new AbortController().signal }, ctx);
-      assert.equal(result, undefined, `default defers to Pi for ${reason}, auto=${enabled}`);
+      assert.equal(result, undefined, `summary defers to Pi for ${reason}, auto=${enabled}`);
       assert.equal(JSON.stringify(preparation), previous, "Pi preparation is not modified");
-      assert.equal(f.manager.getLeafId(), defaultLeaf, "default pass-through has no state writes");
+      assert.equal(f.manager.getLeafId(), summaryLeaf, "summary pass-through has no state writes");
     }
   }
-  assert.equal(notices.length, 0, "running default compaction does not repeat the setting-switch warning");
+  assert.equal(notices.length, 0, "running summary compaction does not repeat the setting-switch warning");
   const saved = path.join(root, "method-session.jsonl");
   saveSession(f.manager, saved);
   const forked = SessionManager.forkFrom(saved, cwd, path.join(root, "forked-sessions"));
   sessionRef.current = forked;
   const forkExt = load(factory, sessionRef);
   await forkExt.commands["compaction-method"].handler("", { ...ctx, sessionManager: forked });
-  assert(notices.at(-1).message.includes("method: default"), "fork inherits the copied branch's method");
+  assert(notices.at(-1).message.includes("method: summary"), "fork inherits the copied branch's method");
   const reopened = SessionManager.open(saved);
   sessionRef.current = reopened;
   const resumedCtx = { ...ctx, sessionManager: reopened };
   const resumed = load(factory, sessionRef);
   await resumed.handlers.session_start({ reason: "resume" }, resumedCtx);
   await resumed.commands["compaction-method"].handler("", resumedCtx);
-  assert(notices.at(-1).message.includes("method: default"), "selection survives session-file reopening and reload");
+  assert(notices.at(-1).message.includes("method: summary"), "selection survives session-file reopening and reload");
   assert.equal((await wrap(current).getSuggestions(["/comp"], 0, 5, options)).items[0].description,
-    "Manually compact with default compaction");
+    "Manually compact with summary compaction");
   await resumed.handlers.session_start({ reason: "reload" }, { ...resumedCtx, ui: { notify: ctx.ui.notify } });
   await resumed.handlers.session_start({ reason: "startup" }, { ...resumedCtx, mode: "rpc", ui: {
     notify: ctx.ui.notify, addAutocompleteProvider: () => assert.fail("RPC must not install UI autocomplete"),
   } });
 
-  assert(notices.every((n) => n.level === "info"), "resume, fork, reload, and checks do not repeat the default warning");
+  assert(notices.every((n) => n.level === "info"), "resume, fork, reload, and checks do not repeat the summary warning");
   sessionRef.current = f.manager;
   f.manager.branch(before);
   assert.equal((await suggest()).items[0].description, "Manually compact with verbatim-compact",
     "tree navigation reads the active branch, not abandoned state");
   const live = f.manager.appendMessage(user("New live branch"));
   await compact(ext, ctx, [f.u], live);
-  f.manager.branch(defaultLeaf);
-  assert.equal((await suggest()).items[0].description, "Manually compact with default compaction");
+  f.manager.branch(summaryLeaf);
+  assert.equal((await suggest()).items[0].description, "Manually compact with summary compaction");
 
-  // Simulate Pi's successful default compaction, then switch back. The opaque
+  // Simulate Pi's successful summary compaction, then switch back. The opaque
   // base stays a summary; new spans and the retained tail remain verbatim.
   f.manager.appendCompaction("MODEL_SUMMARY_BASE", f.kept, 1000);
   notices.length = 0;

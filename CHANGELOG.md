@@ -5,11 +5,11 @@
 - Deterministic checkpoints retain user messages and assistant prose, subject to
   a size guard; thinking, full tool outputs, and arguments remain in Pi's session.
 - Flat chronological spans avoid repeatedly summarizing earlier facts.
-- Session-persistent `/compaction-method verbatim|default` selects manual,
+- Session-persistent `/compaction-method verbatim|summary` selects manual,
   automatic, and overflow-recovery compaction independently of auto-compaction
   on/off. `/compact` autocomplete reflects the method when supported, without
   replacing the command or footer.
-- Default-mode warnings appear only on actual switches, not status checks or
+- Summary-mode warnings appear only on actual switches, not status checks or
   compaction. They clarify that changing the setting alone does not alter context.
   Mixed-context warnings explicitly scope the verbatim guarantee; switching back
   after applying a summary cannot restore earlier model-summarized context to verbatim.

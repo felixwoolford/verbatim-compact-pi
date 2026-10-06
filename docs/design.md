@@ -3,14 +3,14 @@
 ## Compaction pipeline
 
 `session_before_compact` intercepts automatic compaction, `/compact`, and overflow
-recovery. `/compaction-method verbatim|default` selects the method for all three
+recovery. `/compaction-method verbatim|summary` selects the method for all three
 triggers, independently of Pi's auto-compaction on/off setting. The latest valid
 `verbatim-compact:compaction-method` custom entry on the active branch determines
 the method; absence means verbatim. Reading branch state at use time avoids stale
 choices after reload, resume, fork, or tree navigation. Custom entries stay out
 of model context and require no extra configuration file.
 
-In default mode, the hook returns no replacement. Pi generates its
+In summary mode, the hook returns no replacement. Pi generates its
 usual summary with its existing boundary, instructions, and settings. In
 verbatim mode, the extension:
 
@@ -38,12 +38,12 @@ The most recent compaction without span details becomes an opaque
 `<compacted-base>` block. This supports switching from a model-generated summary
 or a legacy verbatim checkpoint. Spans before that base are not re-rendered.
 
-An actual switch to default mode warns that applying model-summary compaction
+An actual switch to summary mode warns that applying model-summary compaction
 may omit or reinterpret details. Changing the setting alone does not alter
-active context: switching back before default compaction runs leaves the
+active context: switching back before summary compaction runs leaves the
 guarantee unchanged. Once a summary is applied, returning to verbatim does not
 restore the earlier verbatim guarantee. Status checks, repeated selections,
-resume, and default compaction itself do not repeat this switch warning. Checkpoints with a model-summary base carry a persistent
+resume, and summary compaction itself do not repeat this switch warning. Checkpoints with a model-summary base carry a persistent
 mixed-context warning near the top: only the labelled verbatim spans and the
 uncompacted tail have the guarantee. Raw history remains recoverable.
 

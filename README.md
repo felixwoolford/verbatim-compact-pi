@@ -86,13 +86,16 @@ To compact manually:
 
 ```text
 /compaction-method
-/compaction-method default
 /compaction-method verbatim
+/compaction-method summary
 ```
 
-With no argument, the command reports
-the current method. A default-mode warning appears when
-actually switching to default, but not on repeated selections, resume, or compaction.
+Verbatim-compact is default so long as the extension is installed.
+/compaction-method is available to opt-in to Pi's builtin summary compaction for the current session.
+
+With no argument, the command reports the current method. A summary-mode warning
+appears when actually switching to summary, but not on repeated selections,
+resume, or compaction.
 The choice applies to
 manual `/compact`, automatic threshold compaction, and context-overflow recovery.
 
@@ -100,13 +103,13 @@ The choice persists in the existing session, follows branch history through
 reload, resume, fork, and tree navigation, and needs no extra configuration file.
 New sessions default to verbatim. The footer is unchanged. On Pi versions with
 `addAutocompleteProvider`, `/compact`'s description changes to “Manually compact
-with verbatim-compact” or “Manually compact with default compaction”; older
+with verbatim-compact” or “Manually compact with summary compaction”; older
 versions retain the built-in description. The `/compact` command itself is not
-replaced, and Pi handles custom summary instructions normally in default mode.
+replaced, and Pi handles custom summary instructions normally in summary mode.
 
-> **Applying default compaction weakens the verbatim guarantee.** Changing this
-> setting does not alter active context; switching back to verbatim before default
-> compaction runs leaves the guarantee unchanged. If default compaction runs
+> **Applying summary compaction weakens the verbatim guarantee.** Changing this
+> setting does not alter active context; switching back to verbatim before summary
+> compaction runs leaves the guarantee unchanged. If summary compaction runs
 > (manually or automatically), it replaces older active context with a
 > model-generated summary, which may omit or reinterpret details. Switching back
 > afterward does not undo this: only subsequent verbatim spans retain the

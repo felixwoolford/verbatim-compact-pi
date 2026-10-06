@@ -34,9 +34,9 @@ import type { ExtensionAPI, ModelRegistry, SessionEntry } from "@earendil-works/
 
 const MECH_KIND = "mech-compact";
 const METHOD_ENTRY = "verbatim-compact:compaction-method";
-type CompactionMethod = "verbatim" | "default";
+type CompactionMethod = "verbatim" | "summary";
 
-const DEFAULT_COMPACTION_WARNING = "Applying default compaction weakens the verbatim guarantee. You may switch back to verbatim compaction before default compaction runs to leave the guarantee unchanged. If default compaction runs (manually or automatically), it replaces older active context with a model-generated summary, which may omit or reinterpret details. Switching back afterward does not undo this: only subsequent verbatim spans retain the guarantee. Original history remains recoverable through context_lookup, but is no longer a direct expansion of the active context.";
+const SUMMARY_COMPACTION_WARNING = "Applying summary compaction weakens the verbatim guarantee. You may switch back to verbatim compaction before summary compaction runs to leave the guarantee unchanged. If summary compaction runs (manually or automatically), it replaces older active context with a model-generated summary, which may omit or reinterpret details. Switching back afterward does not undo this: only subsequent verbatim spans retain the guarantee. Original history remains recoverable through context_lookup, but is no longer a direct expansion of the active context.";
 const MIXED_CONTEXT_WARNING = "**Mixed context: earlier material is model-summarized, not verbatim.** The verbatim guarantee applies only to the labelled verbatim spans and uncompacted tail. The model-summary base may omit or reinterpret details; use `context_lookup` to recover original history.";
 
 // Read from the active branch rather than cached state: reload, resume, fork,
@@ -46,7 +46,7 @@ function compactionMethod(entries: SessionEntry[]): CompactionMethod {
     const entry = entries[i];
     if (entry.type !== "custom" || entry.customType !== METHOD_ENTRY) continue;
     const method = (entry.data as { method?: unknown } | undefined)?.method;
-    if (method === "verbatim" || method === "default") return method;
+    if (method === "verbatim" || method === "summary") return method;
   }
   return "verbatim";
 }
@@ -823,14 +823,14 @@ function sessionTranscript(ctx: { sessionManager: { getBranch: () => SessionEntr
 export default function (pi: ExtensionAPI) {
   // Method selection never changes Pi's auto-compaction enabled setting.
   pi.registerCommand("compaction-method", {
-    description: "Show or set the session compaction method: verbatim|default (manual and automatic)",
-    getArgumentCompletions: (prefix) => ["verbatim", "default"]
+    description: "Show or set the session compaction method: verbatim|summary (manual and automatic)",
+    getArgumentCompletions: (prefix) => ["verbatim", "summary"]
       .filter((method) => method.startsWith(prefix))
       .map((method) => ({ value: method, label: method })),
     handler: async (args, ctx) => {
       const requested = args.trim();
-      if (requested && requested !== "verbatim" && requested !== "default") {
-        ctx.ui.notify("Usage: /compaction-method [verbatim|default]", "error");
+      if (requested && requested !== "verbatim" && requested !== "summary") {
+        ctx.ui.notify("Usage: /compaction-method [verbatim|summary]", "error");
         return;
       }
       const entries = ctx.sessionManager.getBranch();
@@ -839,7 +839,7 @@ export default function (pi: ExtensionAPI) {
       const changed = method !== previous;
       if (changed) pi.appendEntry(METHOD_ENTRY, { method });
       ctx.ui.notify(`Compaction method: ${method} (manual, automatic, and overflow recovery).`, "info");
-      if (changed && method === "default") ctx.ui.notify(DEFAULT_COMPACTION_WARNING, "warning");
+      if (changed && method === "summary") ctx.ui.notify(SUMMARY_COMPACTION_WARNING, "warning");
       else if (changed && collectBaseAndSpans(entries).base?.kind === "model-summary") ctx.ui.notify(MIXED_CONTEXT_WARNING, "warning");
     },
   });
@@ -864,7 +864,7 @@ export default function (pi: ExtensionAPI) {
           items: suggestions.items.map((item) => item.value === "compact"
             ? { ...item, description: method === "verbatim"
               ? "Manually compact with verbatim-compact"
-              : "Manually compact with default compaction" }
+              : "Manually compact with summary compaction" }
             : item),
         };
       },
@@ -881,7 +881,7 @@ export default function (pi: ExtensionAPI) {
     if (!preparation) return;
     if (signal?.aborted) return;
     if (preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0) return;
-    if (compactionMethod(ctx.sessionManager.getBranch()) === "default") {
+    if (compactionMethod(ctx.sessionManager.getBranch()) === "summary") {
       return; // No override: Pi runs its normal model-generated compaction.
     }
 
@@ -965,7 +965,7 @@ export default function (pi: ExtensionAPI) {
         },
       };
     } catch (err) {
-      ctx.ui?.notify?.(`verbatim-compact: failed to build checkpoint (${errMsg(err)}); falling back to default compaction`, "error");
+      ctx.ui?.notify?.(`verbatim-compact: failed to build checkpoint (${errMsg(err)}); falling back to Pi's summary compaction`, "error");
       return;
     }
   });
