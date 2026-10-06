@@ -9,10 +9,13 @@ Compaction itself makes no model call and creates no transcript dump. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
-The primary intended use case is local inference, for example a local 27B model
-through llama.cpp on a consumer GPU. Recovery uses the session model by default;
-no second loaded model or separate subagent extension is required. Frontier-model
-evaluation is in progress.
+Testing indicates that this helps a local lLM-tier model avoid confabulating the historical context and to more carefully verify what it does and does not know.
+
+The primary intended use case is local inference: for example, **Qwen 3.8 27B through
+llama.cpp on an RTX 5090**. Compaction itself makes no model call. Recovery uses
+the session model by default and does not require a second model to be loaded.
+Performance improvements over compaction are greatest in this case, but the tool is also effective with frontier models.
+Performance benchmarking with frontier models is WIP.
 
 ## Install
 
@@ -107,6 +110,10 @@ state. Recovered thinking is reasoning-at-the-time, not verified fact.
 
 ## How it works
 
+The defining property of verbatim-compact is the guarantee that all history is either kept
+verbatim in context or stripped entirely from it; nothing is ever compressed in
+between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and that the remaining information must be verified before being relied on.
+
 ### Deterministic checkpoint
 
 Pi selects the compacted messages and retained boundary. The extension builds a
@@ -132,6 +139,8 @@ The default conversation-section budget is **80,000 characters**. When it fills,
 the oldest non-user lines are removed first; oversized user messages can then be
 shortened or removed. Rendering a smaller checkpoint does not alter raw history.
 The setting is a size guard, not a hard cap on the whole checkpoint.
+
+
 
 ### Session-backed lookup
 
