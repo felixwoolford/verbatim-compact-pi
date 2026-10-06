@@ -65,6 +65,12 @@ cp -r source/* ~/.pi/agent/
 
 Then `/reload`. Project equivalents are `.pi/extensions/` and `.pi/skills/`.
 
+### Uninstallation
+
+To uninstall a package, use `pi remove <the-source-you-installed>` and `/reload`.
+For manual installation, remove the copied extension and skill, then `/reload`.
+Pi's existing session files are unaffected.
+
 ## Usage
 
 Pi's automatic compaction uses verbatim-compact once the extension is loaded.
@@ -94,14 +100,7 @@ references. Raw search results stay out of the main conversation.
 
 After compaction, the checkpoint instructs the agent to re-read required documents,
 even if previously read, re-acquire missing task information, inspect Git state
-when in a Git repository, and re-read files before modifying them. Restore inputs, not repeat completed work:
-do not redo writes, edits, or other state-changing actions merely because their
-results were dropped; recover results with `context_lookup` or verify current
-state if needed. In compacted spans, user and assistant prose is retained verbatim
-(subject to budget trimming), while thinking and tool outputs are removed.
-Retained prose records what was said, not verification of its claims. Historical
-tool output is evidence of past state, not necessarily current source or test
-state. Recovered thinking is reasoning-at-the-time, not verified fact.
+when in a Git repository, and re-read files before modifying them.
 
 ## Configuration
 
@@ -257,9 +256,7 @@ progress. [Details, examples, and scoring notes](docs/pilot-results.md).
 - If checkpoint construction fails, Pi's normal compaction is used. A lookup
   failure reports an error without changing the compaction or session context.
 
-To uninstall a package, use `pi remove <the-source-you-installed>` and `/reload`.
-For manual installation, remove the copied extension and skill, then `/reload`.
-Pi's existing session files are unaffected.
+
 
 ## Development
 
