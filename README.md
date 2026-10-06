@@ -9,9 +9,11 @@ Compaction itself makes no model call. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
+The goal is to let the agent withstand ~8 compactions without the copy-of-a-copy degradation of model-summary compaction, which is exacerbated in sub-frontier models.
+
 The defining property of verbatim-compact is the guarantee that all history is either kept
 verbatim in context or stripped entirely from it; nothing is ever compressed in
-between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and that the remaining information must be verified before being relied on.
+between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and what remaining information must be verified before being relied on.
 Tests indicate that this helps weaker models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The primary intended use case is on a strong local LLM with a reasonably large context window (128k+) : for example, **Qwen 3.8 27B through
