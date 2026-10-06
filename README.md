@@ -5,16 +5,19 @@ recovery. Replaces Pi's model-generated compaction summary with a checkpoint
 built mechanically from conversation text. Thinking and tool outputs are removed
 from the active model context, **not from the session history**.
 
-Compaction itself makes no model call and creates no transcript dump. When a
+Compaction itself makes no model call. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
-Tests indicate that this helps local LLM-tier models avoid confabulating the historical context and to more carefully verify what it does and does not know.
+The defining property of verbatim-compact is the guarantee that all history is either kept
+verbatim in context or stripped entirely from it; nothing is ever compressed in
+between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and that the remaining information must be verified before being relied on.
+Tests indicate that this helps consumer-hardware-tier models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
-The primary intended use case is local inference: for example, **Qwen 3.8 27B through
-llama.cpp on an RTX 5090**. Compaction itself makes no model call. Recovery uses
+The primary intended use case is on a strong local LLM with a reasonably large context window (128k+) : for example, **Qwen 3.8 27B through
+llama.cpp on an RTX 5090**. Recovery uses
 the session model by default and does not require a second model to be loaded.
-Performance improvements over compaction are greatest in this case, but the tool is also effective with frontier models.
+Performance improvements over compaction are greatest in this use case, but the tool is also effective with frontier models.
 Performance benchmarking with frontier models is WIP.
 
 ## Install
@@ -110,9 +113,7 @@ state. Recovered thinking is reasoning-at-the-time, not verified fact.
 
 ## How it works
 
-The defining property of verbatim-compact is the guarantee that all history is either kept
-verbatim in context or stripped entirely from it; nothing is ever compressed in
-between. Every compaction is also followed by a re-orientation block that tells the agent what was removed and that the remaining information must be verified before being relied on.
+
 
 ### Deterministic checkpoint
 
