@@ -233,6 +233,12 @@ base is uncapped and the line budget has a 500-character minimum. Tune it
 alongside the model's context window and Pi's `compaction.keepRecentTokens`.
 [Design details](docs/design.md).
 
+### Local inference engines
+
+When lookups use the session model on a local server, they share its KV cache with the main session.
+
+- **llama.cpp**: on a single-slot server (`-np 1`), each lookup call evicts the main session's KV cache. Enable host-memory prompt caching with `--cache-ram <MiB>`, sized to hold at least one full main-session state, so the main session resumes in seconds instead of re-processing its entire context.
+- **Other engines**: make sure the main session's prefix survives lookup calls, via prefix caching (on by default in vLLM and SGLang), host-RAM KV offloading where available, or enough parallel capacity to keep both sessions resident. Engines without these will re-prefill the main session after every lookup.
 
 ## Limitations and safety
 
