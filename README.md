@@ -148,6 +148,7 @@ Tokens are estimated with `ceil(chars / 4)`, not an exact tokenizer. For a
 characters. Percentages follow the current model's context window after model
 changes; fractional token budgets round down, with a minimum of one token.
 `80000c` preserves the existing budget scope and trimming algorithm exactly.
+See [how cap trimming works](#how-cap-trimming-works) for the removal order.
 
 The budget is a size guard, not a guarantee that the whole model context fits.
 Instructions and file lists remain outside it; inherited opaque bases remain
@@ -191,18 +192,28 @@ starting Pi:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MECH_COMPACT_MAX_SUMMARY_CHARS` | Unset (`25%` budget) | Initial conversation-section character budget override; session cap settings take precedence. |
+| `MECH_COMPACT_MAX_SUMMARY_CHARS` | Unset (uses percentage budget) | Initial conversation-section character budget override; takes precedence over the percentage setting. |
+| `MECH_COMPACT_MAX_SUMMARY_PERCENT` | `25` | Initial percentage of the model's context window, using estimated tokens. Accepts numbers greater than 0 and at most 100, including decimals; invalid values fall back to 25. |
 | `MECH_COMPACT_LOOKUP_MODEL` | Session model | Optional `provider/modelId` for lookups; must support tool calls and be available in Pi. An unresolved model falls back to the session model. |
 | `MECH_COMPACT_LOOKUP_TURNS` | `10` | Maximum search turns; exhaustion adds one final tool-free write-up call. |
 | `MECH_COMPACT_LOOKUP_SESSION_FILE` | Unset | Optional absolute path to a full session JSONL, replacing the current branch as the lookup source. Intended for harnesses using pruned forks. |
 
-For a smaller checkpoint:
+Cap-budget precedence is **session setting → explicit character setting → percentage setting**.
+The initial cap mode remains `warn`.
+
+For a different percentage default, with the character override unset:
+
+```bash
+MECH_COMPACT_MAX_SUMMARY_PERCENT=30 pi
+```
+
+Or use a fixed character budget:
 
 ```bash
 MECH_COMPACT_MAX_SUMMARY_CHARS=40000 pi
 ```
 
-The lookup model, turn budget, and initial cap override are read when the extension loads.
+The lookup model, turn budget, and initial cap settings are read when the extension loads.
 Use `/cap-compaction` to change the session budget or mode without restarting. The
 session-file override is checked at each lookup. Restart Pi after changing its
 launching environment; `/reload` does not change inherited environment variables.
@@ -251,13 +262,35 @@ A single re-orientation block tells the agent what was removed and what must be
 verified before being relied on. A closing line identifies where Pi's retained
 verbatim tail begins.
 
+#### How cap trimming works
+
 The default conversation-section budget is **25% of the model's context window**,
 using estimated tokens, with a prompt before trimming. When trimming is approved
-(or cap mode is `on`), the oldest non-user lines are removed first; oversized user
-messages can then be shortened or removed. Rendering a smaller checkpoint does
-not alter raw history. The setting is a size guard, not a hard cap on the whole
-checkpoint.
+(or cap mode is `on`), **user messages are prioritized over other content**—it is
+not simply a global oldest-first cutoff.
 
+Across all compacted spans, the algorithm proceeds in three stages, stopping as
+soon as the available line budget is satisfied:
+
+1. **Remove non-user entries, oldest first.** Assistant prose, tool-call stubs,
+   and other non-user entries are dropped before any user message is shortened.
+   A newer assistant entry can therefore be removed while an older user message
+   survives. These are whole rendered entries, not individual physical lines;
+   an assistant prose entry can contain multiple paragraphs.
+2. **Shorten long user messages, oldest first.** Each eligible message becomes
+   the first 120 characters of its rendered `[User]: ...` entry (including the
+   prefix), followed by a marker such as
+   `…[truncated +1234 chars — use context_lookup]`. This happens only when the
+   stub is shorter than the original, and each entry is shortened at most once
+   per cap pass. It is a literal prefix, not a model-generated summary.
+3. **Remove the oldest remaining entries if still over budget.** This last
+   resort can remove user messages too, including shortened stubs. A fully
+   dropped span is represented by a trimmed-for-size placeholder.
+
+Only the rendered checkpoint is trimmed: full originals remain in the session
+and the uncapped span details, recoverable through `context_lookup`. The setting
+is a size guard, not a hard cap on the whole checkpoint; the budget scope and
+exceptions described above still apply.
 
 
 ### Session-backed lookup

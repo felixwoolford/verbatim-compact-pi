@@ -65,8 +65,12 @@ instructions contain no filesystem path to the transcript.
 
 ## Size guard
 
-The initial cap policy is `warn 25%`. An explicit `MECH_COMPACT_MAX_SUMMARY_CHARS`
-provides an initial character budget instead. `/cap-compaction [on|off|warn]
+The initial cap mode is `warn`. `MECH_COMPACT_MAX_SUMMARY_PERCENT` provides the
+initial percentage budget (default 25). It accepts finite numbers greater than
+0 and at most 100, including decimals; invalid values fall back to 25. An
+explicit `MECH_COMPACT_MAX_SUMMARY_CHARS` provides a character budget instead,
+taking precedence over the percentage setting. Both are read on extension load;
+session settings take precedence over either. `/cap-compaction [on|off|warn]
 [<chars>c|<estimated tokens>t|<percent>%]` persists mode and budget in a
 `verbatim-compact:cap-compaction` custom entry on the active branch. Omitting
 mode or budget preserves it. Session entries override the initial configuration

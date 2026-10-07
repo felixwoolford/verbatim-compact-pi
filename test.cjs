@@ -1,5 +1,5 @@
 /* Deterministic integration tests for verbatim-compact.ts.
- * Run: node test.cjs [cap|caphang|capspans|capdefault]
+ * Run: node test.cjs [cap|caphang|capspans|capdefault|capenv <percent> <expected budget> [chars]]
  * Uses pi's jiti loader, real SessionManager branches, and stubbed model calls.
  * No credentials, network requests, or pilot runs are needed.
  */
@@ -396,13 +396,16 @@ async function checkpointTests(ext, SessionManager, root) {
 
 async function main() {
   // Make all configuration deterministic and restore the caller's environment.
-  const keys = ["MECH_COMPACT_LOOKUP_SESSION_FILE", "MECH_COMPACT_LOOKUP_MODEL", "MECH_COMPACT_LOOKUP_TURNS", "MECH_COMPACT_MAX_SUMMARY_CHARS", "MECH_COMPACT_DUMP_DIR", "MECH_COMPACT_WARN_GITIGNORE"];
+  const keys = ["MECH_COMPACT_LOOKUP_SESSION_FILE", "MECH_COMPACT_LOOKUP_MODEL", "MECH_COMPACT_LOOKUP_TURNS", "MECH_COMPACT_MAX_SUMMARY_CHARS", "MECH_COMPACT_MAX_SUMMARY_PERCENT", "MECH_COMPACT_DUMP_DIR", "MECH_COMPACT_WARN_GITIGNORE"];
   const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   keys.forEach((key) => { delete process.env[key]; });
   const mode = process.argv[2] ?? "full";
-  assert(["full", "cap", "caphang", "capspans", "capdefault"].includes(mode), `Unknown test mode: ${mode}`);
+  assert(["full", "cap", "caphang", "capspans", "capdefault", "capenv"].includes(mode), `Unknown test mode: ${mode}`);
   const capBudget = mode === "capspans" ? 800 : mode === "caphang" ? 3000 : 80000;
-  if (mode !== "capdefault") process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = String(capBudget);
+  if (mode === "capenv") {
+    process.env.MECH_COMPACT_MAX_SUMMARY_PERCENT = process.argv[3];
+    if (process.argv[5] !== undefined) process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = process.argv[5];
+  } else if (mode !== "capdefault") process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = String(capBudget);
   process.env.MECH_COMPACT_LOOKUP_TURNS = "2";
   process.env.MECH_COMPACT_WARN_GITIGNORE = "0";
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verbatim-compact-test-"));
@@ -414,6 +417,10 @@ async function main() {
     const capHelpers = { factory, SessionManager, root, load, makeContext, compact, saveSession, user };
     if (mode === "capdefault") {
       await capPolicyTests.defaultBudgetTests(capHelpers);
+      return;
+    }
+    if (mode === "capenv") {
+      await capPolicyTests.envBudgetTests({ ...capHelpers, expectedBudget: process.argv[4] });
       return;
     }
     if (mode !== "full") {

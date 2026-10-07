@@ -249,3 +249,47 @@ module.exports.defaultBudgetTests = async function ({ factory, SessionManager, r
   await command.handler("off", ctx);
   assert((await attempt()).compaction.summary.includes(content));
 };
+
+module.exports.envBudgetTests = async function ({ factory, SessionManager, root, load, makeContext, user, expectedBudget }) {
+  console.log(`== Environment cap: percent=${process.env.MECH_COMPACT_MAX_SUMMARY_PERCENT}, chars=${process.env.MECH_COMPACT_MAX_SUMMARY_CHARS ?? "unset"}, expected ${expectedBudget} ==`);
+  assert(/^(\d+(?:\.\d+)?)(%|c)$/.test(expectedBudget), "test must supply an explicit expected budget");
+  const manager = SessionManager.inMemory(root);
+  const u = manager.appendMessage(user("ENV_CAP_TEXT ".repeat(26000)));
+  const kept = manager.appendMessage(user("Retained tail"));
+  const ext = load(factory, { current: manager });
+  const notices = [];
+  const ctx = { ...makeContext(manager, root), model: { contextWindow: 192000 }, ui: {
+    notify: (message, level) => notices.push({ message, level }),
+  } };
+  const command = ext.commands["cap-compaction"];
+  const leaf = manager.getLeafId();
+  await command.handler("", ctx);
+  assert(notices.at(-1).message.includes(`cap: warn; budget ${expectedBudget} (`));
+  assert.equal(manager.getLeafId(), leaf, "environment configuration does not create session state");
+  const isPercent = expectedBudget.endsWith("%");
+  const value = Number(expectedBudget.slice(0, -1));
+  if (isPercent) {
+    const tokens = Math.floor(192000 * value / 100);
+    assert(notices.at(-1).message.includes(`${tokens.toLocaleString()} estimated tokens; ${(tokens * 4).toLocaleString()} chars`));
+    ctx.model.contextWindow = 384000;
+    await command.handler("", ctx);
+    const switchedTokens = Math.floor(384000 * value / 100);
+    assert(notices.at(-1).message.includes(`${switchedTokens.toLocaleString()} estimated tokens`), "environment percentages still follow model switches");
+  } else {
+    ctx.model = undefined;
+    await command.handler("", ctx);
+    assert(notices.at(-1).message.includes(`${value.toLocaleString()} chars`), "explicit chars override percent without needing a model");
+  }
+  // Defaults are captured on load, not reread from the environment at every use.
+  process.env.MECH_COMPACT_MAX_SUMMARY_PERCENT = "75";
+  await command.handler("", ctx);
+  assert(notices.at(-1).message.includes(`budget ${expectedBudget} (`));
+  await command.handler("warn 10%", ctx);
+  assert(notices.at(-1).message.includes("budget 10% ("), "session settings override either environment unit");
+  await command.handler("on 20000c", ctx);
+  ctx.model = undefined;
+  const result = await ext.handlers.session_before_compact({ reason: "manual", branchEntries: manager.getBranch(),
+    signal: new AbortController().signal, preparation: { messagesToSummarize: [manager.getEntry(u).message],
+      turnPrefixMessages: [], firstKeptEntryId: kept, tokensBefore: 123456 } }, ctx);
+  assert(result.compaction, "session character override compacts normally regardless of the environment defaults");
+};

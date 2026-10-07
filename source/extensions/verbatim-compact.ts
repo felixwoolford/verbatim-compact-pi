@@ -11,7 +11,8 @@
  * or prune old dumps.
  *
  * Optional env settings:
- *   MECH_COMPACT_MAX_SUMMARY_CHARS    initial character budget override (default: 25% of context)
+ *   MECH_COMPACT_MAX_SUMMARY_CHARS    initial character budget override (takes precedence over percent)
+ *   MECH_COMPACT_MAX_SUMMARY_PERCENT  initial percentage of model context (default 25; >0, <=100)
  *   MECH_COMPACT_LOOKUP_MODEL         "provider/modelId" for the lookup subagent
  *   MECH_COMPACT_LOOKUP_TURNS         max search turns (default 10), plus one
  *                                    final write-up when the budget is exhausted
@@ -58,10 +59,15 @@ function intFromEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function percentFromEnv(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 && n <= 100 ? n : fallback;
+}
+
 const cfg = {
   defaultCapBudget: (process.env.MECH_COMPACT_MAX_SUMMARY_CHARS
     ? { unit: "chars", value: intFromEnv("MECH_COMPACT_MAX_SUMMARY_CHARS", 80_000) }
-    : { unit: "percent", value: 25 }) as CapBudget,
+    : { unit: "percent", value: percentFromEnv("MECH_COMPACT_MAX_SUMMARY_PERCENT", 25) }) as CapBudget,
   lookupTurns: intFromEnv("MECH_COMPACT_LOOKUP_TURNS", 10),
   lookupModel: process.env.MECH_COMPACT_LOOKUP_MODEL?.trim() || undefined,
   argSnippetChars: 160,

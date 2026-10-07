@@ -25,6 +25,10 @@
   Tokens are estimated, percentages follow model changes, and explicit character
   budgets retain the existing scope and algorithm. The environment character
   setting remains an initial-budget override.
+- `MECH_COMPACT_MAX_SUMMARY_PERCENT` configures the initial percentage budget
+  (default 25, fractional values supported). Session settings override explicit
+  character settings, which override the percentage setting; invalid percentages
+  fall back to 25.
 - Trim prompts can apply the cap, persist `off`, change the budget, or cancel.
   Non-interactive mode warns and caps; cancellation never falls through to summary.
 - Removed `/dump-context`, `dump_context`, and the `dumpDir` lookup argument;
