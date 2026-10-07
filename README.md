@@ -13,9 +13,7 @@ The goal is to let the agent withstand ~8 compactions without the copy-of-a-copy
 
 The defining property of verbatim-compact is the guarantee that all history is either kept
 verbatim in context or stripped entirely from it; nothing is ever compressed in
-between. This guarantee applies to verbatim spans and the uncompacted tail, not
-an inherited model-generated summary. Default compaction is an explicit opt-in
-that weakens this guarantee (see [Usage](#usage)). Every verbatim compaction is also followed by a re-orientation block that tells the agent what was removed and what remaining information must be verified before being relied on.
+between. Every verbatim compaction is also followed by a re-orientation block that tells the agent what was removed and what remaining information must be verified before being relied on.
 Tests indicate that this helps weaker models to avoid confabulating the historical context and to more carefully verify what it does and does not know.
 
 The primary intended use case is on a strong local LLM with a reasonably large context window (128k+) : for example, **Qwen 3.8 27B through
@@ -90,8 +88,7 @@ To compact manually:
 /compaction-method summary
 ```
 
-Verbatim-compact is default so long as the extension is installed.
-/compaction-method is available to opt-in to Pi's builtin summary compaction for the current session.
+`/compaction-method` is available to opt-in to Pi's builtin summary compaction for the current session.
 
 With no argument, the command reports the current method. A summary-mode warning
 appears when actually switching to summary, but not on repeated selections,
