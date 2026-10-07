@@ -1,5 +1,5 @@
 /* Deterministic integration tests for verbatim-compact.ts.
- * Run: node test.cjs [cap|caphang|capspans]
+ * Run: node test.cjs [cap|caphang|capspans|capdefault]
  * Uses pi's jiti loader, real SessionManager branches, and stubbed model calls.
  * No credentials, network requests, or pilot runs are needed.
  */
@@ -400,9 +400,9 @@ async function main() {
   const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   keys.forEach((key) => { delete process.env[key]; });
   const mode = process.argv[2] ?? "full";
-  assert(["full", "cap", "caphang", "capspans"].includes(mode), `Unknown test mode: ${mode}`);
+  assert(["full", "cap", "caphang", "capspans", "capdefault"].includes(mode), `Unknown test mode: ${mode}`);
   const capBudget = mode === "capspans" ? 800 : mode === "caphang" ? 3000 : 80000;
-  process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = String(capBudget);
+  if (mode !== "capdefault") process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = String(capBudget);
   process.env.MECH_COMPACT_LOOKUP_TURNS = "2";
   process.env.MECH_COMPACT_WARN_GITIGNORE = "0";
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verbatim-compact-test-"));
@@ -410,13 +410,20 @@ async function main() {
     const { SessionManager, loadSkillsFromDir } = await jiti.import("@earendil-works/pi-coding-agent");
     const { default: factory } = await jiti.import(path.join(__dirname, "source", "extensions", "verbatim-compact.ts"));
     const ext = load(factory);
+    const capPolicyTests = require("./scripts/cap-policy-tests.cjs");
+    const capHelpers = { factory, SessionManager, root, load, makeContext, compact, saveSession, user };
+    if (mode === "capdefault") {
+      await capPolicyTests.defaultBudgetTests(capHelpers);
+      return;
+    }
     if (mode !== "full") {
       await capTests(ext, SessionManager, root, capBudget);
       return;
     }
     assert.deepEqual(Object.keys(ext.tools), ["context_lookup"]);
-    assert.deepEqual(Object.keys(ext.commands), ["compaction-method"]);
+    assert.deepEqual(Object.keys(ext.commands), ["compaction-method", "cap-compaction"]);
     await methodTests(factory, SessionManager, root);
+    await capPolicyTests(capHelpers);
     assert.deepEqual(Object.keys(ext.tools.context_lookup.parameters.properties), ["question"]);
     assert(!ext.tools.context_lookup.description.includes(".pi/context-dumps"));
 

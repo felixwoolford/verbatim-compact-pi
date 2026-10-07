@@ -13,6 +13,7 @@ for (const args of [
   ["test.cjs", "cap"],
   ["test.cjs", "caphang"],
   ["test.cjs", "capspans"],
+  ["test.cjs", "capdefault"],
   ["scripts/test-package.cjs"],
 ]) {
   const result = spawnSync(process.execPath, args, { cwd: root, env, stdio: "inherit" });

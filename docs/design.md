@@ -65,8 +65,29 @@ instructions contain no filesystem path to the transcript.
 
 ## Size guard
 
-`MECH_COMPACT_MAX_SUMMARY_CHARS` defaults to 80,000. It is a character budget for
-the conversation section, not a token budget for the entire model context.
+The initial cap policy is `warn 25%`. An explicit `MECH_COMPACT_MAX_SUMMARY_CHARS`
+provides an initial character budget instead. `/cap-compaction [on|off|warn]
+[<chars>c|<estimated tokens>t|<percent>%]` persists mode and budget in a
+`verbatim-compact:cap-compaction` custom entry on the active branch. Omitting
+mode or budget preserves it. Session entries override the initial configuration
+and stay out of model context.
+
+Budgets cover the same conversation section as before. `80000c` is identical to
+the old 80,000-character guard. Token budgets resolve to four characters per
+estimated token (`ceil(chars / 4)`), not an exact tokenizer count. Percentages
+resolve against the current model's token context window, rounding down to whole
+tokens (minimum one), then converting to characters. Thus 25% of 192,000 tokens
+is 48,000 estimated tokens or 192,000 characters. Resolution at compaction time
+ensures model switches affect subsequent compactions without rewriting settings.
+
+`on` trims without prompting; `off` leaves span lines uncapped. `warn` prompts
+only when the existing cap algorithm would actually remove or shorten span
+content, using the same overhead allocation and 500-character floor. The user
+can apply trimming, persist `off`, change the session budget and recheck, or
+cancel compaction. Esc, abort, and dialog failures cancel instead of falling
+through to Pi's summary compaction. No interactive UI means warn and apply the
+cap; supported RPC clients can answer the dialogs. An unresolved percentage
+cancels with an error rather than guessing a budget.
 
 When span content exceeds the available budget, the extension:
 
@@ -80,8 +101,10 @@ not capped. Instructions, file lists, and other checkpoint text sit outside the
 conversation section. This is a size guard, not a strict upper bound on the total
 checkpoint or, in these exceptional cases, the conversation section.
 
-For limited context, reduce this value and leave room for Pi's verbatim tail,
-system prompt, tools, and subsequent work. The extension does not calculate a
+For limited context, reduce the budget and leave room for Pi's verbatim tail,
+system prompt, tools, and subsequent work. Disabling the cap still removes
+thinking/tool results and abbreviates tool-call signatures; it can leave too much
+context for the model, particularly during overflow recovery. The extension does not calculate a
 model-specific optimal budget.
 
 ## Lookup source and transcript fidelity

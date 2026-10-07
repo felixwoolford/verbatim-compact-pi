@@ -20,12 +20,19 @@
   pruned harness forks, with explicit failures for invalid overrides.
 - Subagent lookup provides list, grep, and entry-retrieval tools; exhausted lookups
   receive one final tool-free write-up of partial findings.
-- Default conversation-section budget: 80,000 characters.
+- Session/branch-persistent `/cap-compaction [on|off|warn] [80000c|20000t|25%]`
+  controls trimming; the default is `warn 25%` of the current model context window.
+  Tokens are estimated, percentages follow model changes, and explicit character
+  budgets retain the existing scope and algorithm. The environment character
+  setting remains an initial-budget override.
+- Trim prompts can apply the cap, persist `off`, change the budget, or cancel.
+  Non-interactive mode warns and caps; cancellation never falls through to summary.
 - Removed `/dump-context`, `dump_context`, and the `dumpDir` lookup argument;
   old dump-directory and git-ignore warning settings are unused.
 - Bundled `context-retrieval` skill describes session-backed evidence recovery,
   branch scope, historical provenance, and re-verification after compaction.
 - Deterministic tests cover session recovery, overrides, attribution, size guards,
+  cap dialogs/modes/budgets, percentage defaults/model changes, cancellation,
   the skill, and Pi's real package loader.
 - Preliminary synthetic pilot figures are preserved as historical results from
   the dump-based implementation, not measurements of the current implementation.

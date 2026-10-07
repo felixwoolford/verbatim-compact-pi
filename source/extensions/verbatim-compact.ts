@@ -11,7 +11,7 @@
  * or prune old dumps.
  *
  * Optional env settings:
- *   MECH_COMPACT_MAX_SUMMARY_CHARS    conversation-section guard (default 80000)
+ *   MECH_COMPACT_MAX_SUMMARY_CHARS    initial character budget override (default: 25% of context)
  *   MECH_COMPACT_LOOKUP_MODEL         "provider/modelId" for the lookup subagent
  *   MECH_COMPACT_LOOKUP_TURNS         max search turns (default 10), plus one
  *                                    final write-up when the budget is exhausted
@@ -26,7 +26,7 @@ import { contentText, normalizeContext, uuidv7 } from "@earendil-works/pi-ai";
 import type { Message as AiMessage, Model, Tool as AiTool } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ModelRegistry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ModelRegistry, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
 // Configuration
@@ -59,7 +59,9 @@ function intFromEnv(name: string, fallback: number): number {
 }
 
 const cfg = {
-  maxSummaryChars: intFromEnv("MECH_COMPACT_MAX_SUMMARY_CHARS", 80_000),
+  defaultCapBudget: (process.env.MECH_COMPACT_MAX_SUMMARY_CHARS
+    ? { unit: "chars", value: intFromEnv("MECH_COMPACT_MAX_SUMMARY_CHARS", 80_000) }
+    : { unit: "percent", value: 25 }) as CapBudget,
   lookupTurns: intFromEnv("MECH_COMPACT_LOOKUP_TURNS", 10),
   lookupModel: process.env.MECH_COMPACT_LOOKUP_MODEL?.trim() || undefined,
   argSnippetChars: 160,
@@ -67,6 +69,120 @@ const cfg = {
   showEntryMaxChars: 24_000,
   lookupAnswerMaxChars: 12_000,
 };
+
+// Cap policy is session/branch state, separate from the compaction method.
+const CAP_ENTRY = "verbatim-compact:cap-compaction";
+type CapMode = "on" | "off" | "warn";
+interface CapBudget { unit: "chars" | "tokens" | "percent"; value: number }
+interface CapSettings { mode: CapMode; budget: CapBudget }
+
+function validCapBudget(value: unknown): value is CapBudget {
+  if (!value || typeof value !== "object") return false;
+  const { unit, value: n } = value as CapBudget;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return false;
+  if (unit === "percent") return n <= 100;
+  return Number.isSafeInteger(n) && (unit === "chars" || (unit === "tokens" && n <= Number.MAX_SAFE_INTEGER / 4));
+}
+
+function parseCapBudget(text: string): CapBudget | undefined {
+  const match = /^(\d+(?:\.\d+)?)(c|t|%)$/.exec(text);
+  if (!match) return;
+  const budget: CapBudget = { value: Number(match[1]), unit: match[2] === "c" ? "chars" : match[2] === "t" ? "tokens" : "percent" };
+  return validCapBudget(budget) ? budget : undefined;
+}
+
+function capSettings(entries: SessionEntry[]): CapSettings {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "custom" || entry.customType !== CAP_ENTRY) continue;
+    const state = entry.data as CapSettings | undefined;
+    if (state && ["on", "off", "warn"].includes(state.mode) && validCapBudget(state.budget)) return state;
+  }
+  return { mode: "warn", budget: { ...cfg.defaultCapBudget } };
+}
+
+function capBudgetText(budget: CapBudget): string {
+  return `${budget.value}${budget.unit === "chars" ? "c" : budget.unit === "tokens" ? "t" : "%"}`;
+}
+
+function capBudgetChars(budget: CapBudget, contextWindow?: number): number | undefined {
+  if (budget.unit === "chars") return budget.value;
+  if (budget.unit === "tokens") return budget.value * 4;
+  if (!contextWindow || !Number.isSafeInteger(contextWindow) || contextWindow <= 0) return;
+  const tokens = Math.max(1, Math.floor(contextWindow * budget.value / 100));
+  return tokens <= Number.MAX_SAFE_INTEGER / 4 ? tokens * 4 : undefined;
+}
+
+function capDescription(state: CapSettings, contextWindow?: number): string {
+  const chars = capBudgetChars(state.budget, contextWindow);
+  const resolved = chars === undefined ? "model context window unavailable" : state.budget.unit === "chars"
+    ? `${chars.toLocaleString()} chars`
+    : `${(chars / 4).toLocaleString()} estimated tokens; ${chars.toLocaleString()} chars`;
+  return `Verbatim compaction cap: ${state.mode}; budget ${capBudgetText(state.budget)} (${resolved}).`;
+}
+
+function persistCap(pi: ExtensionAPI, previous: CapSettings, next: CapSettings): void {
+  if (previous.mode !== next.mode || previous.budget.unit !== next.budget.unit || previous.budget.value !== next.budget.value)
+    pi.appendEntry(CAP_ENTRY, next);
+}
+
+// undefined means uncapped; null means cancel (never fall through to summary).
+async function chooseCapBudget(pi: ExtensionAPI, ctx: ExtensionContext, signal: AbortSignal | undefined,
+  reason: string, size: { overhead: number; lineChars: number }): Promise<number | undefined | null> {
+  try {
+    let state = capSettings(ctx.sessionManager.getBranch());
+    for (;;) {
+      if (signal?.aborted) return null;
+      if (state.mode === "off") return undefined;
+      const limit = capBudgetChars(state.budget, ctx.model?.contextWindow);
+      if (limit === undefined) {
+        ctx.ui.notify("verbatim-compact: cannot resolve percentage cap without the model's context window; choose a c/t budget or turn the cap off.", "error");
+        return null;
+      }
+      // Exactly the existing cap's test, including its minimum 500-char line budget.
+      const needsTrim = size.lineChars > Math.max(500, limit - size.overhead);
+      if (state.mode !== "warn" || !needsTrim) return limit;
+      const warning = `Verbatim compaction would trim content: ~${(size.overhead + size.lineChars).toLocaleString()} conversation-section chars; budget ${capBudgetText(state.budget)} (${limit.toLocaleString()} chars).`;
+      if (!ctx.hasUI || typeof ctx.ui.select !== "function") {
+        ctx.ui.notify(`${warning} Applying the cap because no interactive UI is available.`, "warning");
+        return limit;
+      }
+      const risk = reason === "overflow"
+        ? "Overflow recovery: disabling the cap may leave too much context for the retry."
+        : "Disabling the cap may leave too much context for the model.";
+      const choice = await ctx.ui.select(`${warning}\n${risk}`, [
+        "Apply trimming", "Disable cap for this session", "Change budget", "Cancel compaction",
+      ], { signal });
+      if (signal?.aborted) return null;
+      if (choice === "Apply trimming") return limit;
+      if (choice === "Disable cap for this session") {
+        const next: CapSettings = { ...state, mode: "off" };
+        persistCap(pi, state, next);
+        ctx.ui.notify(capDescription(next, ctx.model?.contextWindow), "info");
+        return undefined;
+      }
+      if (choice !== "Change budget") return null;
+      for (;;) {
+        if (typeof ctx.ui.input !== "function") return null;
+        const input = await ctx.ui.input("Compaction budget: <chars>c, <estimated tokens>t, or <context window>%", capBudgetText(state.budget), { signal });
+        if (signal?.aborted || input === undefined) return null;
+        const budget = parseCapBudget(input.trim());
+        if (!budget) {
+          ctx.ui.notify("Invalid budget: use a positive integer with c/t, or a percentage greater than 0 and at most 100% (e.g. 80000c, 20000t, 25%).", "error");
+          continue;
+        }
+        const next = { ...state, budget };
+        persistCap(pi, state, next);
+        state = next;
+        ctx.ui.notify(capDescription(state, ctx.model?.contextWindow), "info");
+        break; // Recheck: a smaller/new budget may still require trimming.
+      }
+    }
+  } catch (err) {
+    if (!signal?.aborted) ctx.ui?.notify?.(`verbatim-compact: unable to resolve cap decision (${errMsg(err)}); compaction cancelled`, "error");
+    return null;
+  }
+}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -455,7 +571,7 @@ const REORIENT_BLOCK = `**Re-orient before continuing.** Compaction may have rem
 
 **Recovering dropped details.** Information removed from your active context is preserved in the session. Use \`context_lookup\` to recover relevant details, including earlier thinking and tool outputs. Do NOT grep the session file yourself in this conversation — that would fill your context with raw transcript text. Call the \`context_lookup\` tool with a specific question; a subagent searches the session transcript in its own context and returns only the relevant findings.`;
 
-function buildMechanicalSummary(opts: {
+async function buildMechanicalSummary(opts: {
   reason: string; // pi's raw reason: "manual" | "threshold" | "overflow"
   tokensBefore: number;
   branchEntries: SessionEntry[];
@@ -467,7 +583,8 @@ function buildMechanicalSummary(opts: {
   readFiles: string[];
   modifiedFiles: string[];
   notify: (msg: string) => void;
-}): string {
+  chooseCap: (size: { overhead: number; lineChars: number }) => Promise<number | undefined | null>;
+}): Promise<string | undefined> {
   const { base, spans } = collectBaseAndSpans(opts.branchEntries);
   const allSpans = [...spans, { at: opts.now, reason: opts.reason, from: opts.spanFrom, to: opts.spanTo, lines: opts.spanLines }];
   const coversOf = (s: { from?: string; to?: string }): string | undefined => (s.from && s.to ? `${s.from} → ${s.to}` : undefined);
@@ -483,10 +600,6 @@ function buildMechanicalSummary(opts: {
     (a, s, i) => a + spanOpen(i + 1, s.at, s.reason, coversOf(s)).length + SPAN_TRIMMED_ATTR.length + 2 + SPAN_TRIMMED_NOTE.length + 1 + SPAN_CLOSE.length + 2,
     0,
   );
-  if (base && base.summary.length > cfg.maxSummaryChars)
-    opts.notify(
-      `verbatim-compact: the base block alone is ${base.summary.length.toLocaleString()} chars (budget ${cfg.maxSummaryChars.toLocaleString()}); it is kept un-capped`,
-    );
   // Closing line: where the verbatim (uncompacted) tail begins. Spans end at
   // pi's cut point, which is earlier than the compaction time — the tail is
   // named by the first kept entry's timestamp (no time if it cannot be found).
@@ -497,8 +610,13 @@ function buildMechanicalSummary(opts: {
       ? `Conversation from ${keptTime} onward continues verbatim below — it was not compacted.`
       : `Conversation continues verbatim below — it was not compacted.`;
   overhead += closingLine.length + 2;
-  const lineBudget = Math.max(500, cfg.maxSummaryChars - overhead);
-  const capped = capSpans(allSpans.map((s) => s.lines), lineBudget);
+  const lines = allSpans.map((s) => s.lines);
+  const lineChars = lines.reduce((total, span) => total + span.reduce((n, line) => n + line.length + 1, 0), 0);
+  const maxChars = await opts.chooseCap({ overhead, lineChars });
+  if (maxChars === null) return undefined;
+  if (maxChars !== undefined && base && base.summary.length > maxChars)
+    opts.notify(`verbatim-compact: the base block alone is ${base.summary.length.toLocaleString()} chars (budget ${maxChars.toLocaleString()}); it is kept un-capped`);
+  const capped = maxChars === undefined ? lines : capSpans(lines, Math.max(500, maxChars - overhead));
 
   const blocks: string[] = [];
   if (base) blocks.push(`${baseOpen}\n${base.summary.replace(/\n+$/, "")}\n${BASE_CLOSE}`);
@@ -844,6 +962,29 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("cap-compaction", {
+    description: "Show or set verbatim compaction cap: on|off|warn [80000c|20000t|25%]",
+    getArgumentCompletions: (prefix) => {
+      const mode = /^(on|off|warn)\s/.exec(prefix)?.[1];
+      const values = mode ? ["80000c", "20000t", "25%"].map((budget) => `${mode} ${budget}`)
+        : ["on", "off", "warn", "80000c", "20000t", "25%"];
+      return values.filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value }));
+    },
+    handler: async (args, ctx) => {
+      const previous = capSettings(ctx.sessionManager.getBranch());
+      const words = args.trim().split(/\s+/).filter(Boolean);
+      const mode = ["on", "off", "warn"].includes(words[0]) ? words.shift() as CapMode : previous.mode;
+      const budget = words.length === 0 ? previous.budget : words.length === 1 ? parseCapBudget(words[0]) : undefined;
+      if (!budget) {
+        ctx.ui.notify("Usage: /cap-compaction [on|off|warn] [<chars>c|<estimated tokens>t|<percent>%]; percentages must be >0 and <=100.", "error");
+        return;
+      }
+      const next = { mode, budget };
+      persistCap(pi, previous, next);
+      ctx.ui.notify(`${capDescription(next, ctx.model?.contextWindow)} Applies only to verbatim compaction.`, "info");
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
     const entries = ctx.sessionManager.getBranch();
     if (compactionMethod(entries) === "verbatim" && collectBaseAndSpans(entries).base?.kind === "model-summary") {
@@ -930,7 +1071,7 @@ export default function (pi: ExtensionAPI) {
       const spanLines = summarizeMessages(allMessages);
 
       // 3) Build the mechanical summary (no LLM call).
-      const summary = buildMechanicalSummary({
+      const summary = await buildMechanicalSummary({
         reason, // pi's raw reason, passed through unchanged
         tokensBefore: preparation.tokensBefore,
         branchEntries,
@@ -942,7 +1083,9 @@ export default function (pi: ExtensionAPI) {
         readFiles,
         modifiedFiles,
         notify: (m) => ctx.ui?.notify?.(m, "warning"),
+        chooseCap: (size) => chooseCapBudget(pi, ctx, signal, reason, size),
       });
+      if (summary === undefined || signal?.aborted) return { cancel: true };
 
       ctx.ui?.notify?.(
         `verbatim-compact: ~${preparation.tokensBefore.toLocaleString()} tokens -> verbatim checkpoint; full transcript kept in the session`,

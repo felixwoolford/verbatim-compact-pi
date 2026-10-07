@@ -121,6 +121,48 @@ Later verbatim checkpoints containing a model-summary base prominently warn:
 verbatim guarantee applies only to the labelled verbatim spans and uncompacted
 tail—not to the opaque summary base.
 
+### Control the compaction cap
+
+The default is **`warn 25%`**: a conversation-section budget of 25% of the current
+model's context window, using estimated tokens. When content would actually be
+trimmed, choose **Apply trimming**, **Disable cap for this session**, **Change
+budget**, or **Cancel compaction**. Disabling persists as `off`, rather than
+bypassing just once. Cancel or Esc cancels compaction; it does not fall through
+to summary compaction.
+
+```text
+/cap-compaction                 # report mode and budget
+/cap-compaction warn             # prompt before trimming (default)
+/cap-compaction on               # trim without prompting
+/cap-compaction off              # disable cap-based trimming
+/cap-compaction warn 20000t      # estimated tokens
+/cap-compaction warn 25%         # percentage of model context window
+/cap-compaction on 80000c        # the original character guard
+```
+
+Mode and budget are independent: omitting either preserves it. Budget-only input
+such as `/cap-compaction 40000c` also works. Both settings persist in the session
+and follow branch history through reload, resume, fork, and tree navigation.
+They apply only to verbatim compaction, not summary compaction, and do not change
+Pi's auto-compaction enabled setting.
+
+Tokens are estimated with `ceil(chars / 4)`, not an exact tokenizer. For a
+192,000-token window, `25%` gives 48,000 estimated tokens, equivalent to 192,000
+characters. Percentages follow the current model's context window after model
+changes; fractional token budgets round down, with a minimum of one token.
+`80000c` preserves the existing budget scope and trimming algorithm exactly.
+
+The budget is a size guard, not a guarantee that the whole model context fits.
+Instructions and file lists remain outside it; inherited opaque bases remain
+uncapped and the minimum line budget remains 500 characters. Disabling the cap
+still removes thinking and tool outputs and abbreviates tool-call signatures.
+It may leave too much context for the model, particularly during overflow recovery.
+
+With no interactive UI, `warn` emits a warning and applies the cap. TUI and
+supported RPC clients can answer the dialogs. If a percentage cannot be resolved
+because the model's context window is unavailable, compaction is cancelled:
+choose a character/token budget or turn the cap off.
+
 ### Recover historical details
 
 The extension registers one model-callable tool:
@@ -152,7 +194,7 @@ starting Pi:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MECH_COMPACT_MAX_SUMMARY_CHARS` | `80000` | Conversation-section character budget. |
+| `MECH_COMPACT_MAX_SUMMARY_CHARS` | Unset (`25%` budget) | Initial conversation-section character budget override; session cap settings take precedence. |
 | `MECH_COMPACT_LOOKUP_MODEL` | Session model | Optional `provider/modelId` for lookups; must support tool calls and be available in Pi. An unresolved model falls back to the session model. |
 | `MECH_COMPACT_LOOKUP_TURNS` | `10` | Maximum search turns; exhaustion adds one final tool-free write-up call. |
 | `MECH_COMPACT_LOOKUP_SESSION_FILE` | Unset | Optional absolute path to a full session JSONL, replacing the current branch as the lookup source. Intended for harnesses using pruned forks. |
@@ -163,7 +205,8 @@ For a smaller checkpoint:
 MECH_COMPACT_MAX_SUMMARY_CHARS=40000 pi
 ```
 
-The model, turn budget, and size guard are read when the extension loads. The
+The lookup model, turn budget, and initial cap override are read when the extension loads.
+Use `/cap-compaction` to change the session budget or mode without restarting. The
 session-file override is checked at each lookup. Restart Pi after changing its
 launching environment; `/reload` does not change inherited environment variables.
 The extension does not automatically load `.env` files.
@@ -211,10 +254,12 @@ A single re-orientation block tells the agent what was removed and what must be
 verified before being relied on. A closing line identifies where Pi's retained
 verbatim tail begins.
 
-The default conversation-section budget is **80,000 characters**. When it fills,
-the oldest non-user lines are removed first; oversized user messages can then be
-shortened or removed. Rendering a smaller checkpoint does not alter raw history.
-The setting is a size guard, not a hard cap on the whole checkpoint.
+The default conversation-section budget is **25% of the model's context window**,
+using estimated tokens, with a prompt before trimming. When trimming is approved
+(or cap mode is `on`), the oldest non-user lines are removed first; oversized user
+messages can then be shortened or removed. Rendering a smaller checkpoint does
+not alter raw history. The setting is a size guard, not a hard cap on the whole
+checkpoint.
 
 
 
