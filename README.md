@@ -29,7 +29,13 @@ other versions have not been verified here.
 
 ### Package installation
 
-From a downloaded or cloned checkout:
+Install from git:
+
+```bash
+pi install git:github.com/felixwoolford/verbatim-compact-pi
+```
+
+or from a downloaded or cloned checkout:
 
 ```bash
 pi install /absolute/path/to/verbatim-compact
@@ -37,13 +43,6 @@ pi install /absolute/path/to/verbatim-compact
 
 This installs both the extension and the `context-retrieval` skill. Run `/reload`
 in an existing Pi session, or restart Pi.
-
-Once the GitHub repository and release tag exist, install directly with the
-following command:
-
-```bash
-pi install git:github.com/felixwoolford/verbatim-compact
-```
 
 Use `pi install --local <source>` for a project-only installation. To load a
 local checkout for one invocation without saving an installation:
