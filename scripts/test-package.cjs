@@ -48,7 +48,7 @@ async function main() {
     assert.deepEqual(loaded.errors, [], "real Pi extension loader reports no errors");
     assert.equal(loaded.extensions.length, 1);
     const extension = loaded.extensions[0];
-    assert.deepEqual([...extension.tools.keys()], ["context_lookup"], "only the session lookup tool is registered");
+    assert.deepEqual([...extension.tools.keys()], ["context_list_entries", "context_grep", "context_show_entry", "context_lookup"], "session lookup and three direct fallback tools are registered");
     assert.deepEqual([...extension.commands.keys()], ["compaction-method", "cap-compaction"], "method and cap selection are registered, with no dump or replacement compact command");
     const lookup = extension.tools.get("context_lookup");
     assert.deepEqual(Object.keys(lookup.definition.parameters.properties), ["question"], "lookup has no dump-selection argument");

@@ -1,5 +1,5 @@
 /* Deterministic integration tests for verbatim-compact.ts.
- * Run: node test.cjs [cap|caphang|capspans|capdefault|capenv <percent> <expected budget> [chars]]
+ * Run: node test.cjs [cap|caphang|capspans|capdefault|capenv <percent> <expected budget> [chars]|lookupenv <limit> <expected limit>]
  * Uses pi's jiti loader, real SessionManager branches, and stubbed model calls.
  * No credentials, network requests, or pilot runs are needed.
  */
@@ -73,6 +73,9 @@ async function compact(ext, ctx, ids, kept, reason = "manual", fileOps) {
   assert(!c.summary.includes(ctx.cwd), "checkpoint does not disclose the transcript path");
   assert(!c.summary.includes("see dump"));
   assert(c.summary.includes("kept in the session; use `context_lookup`"));
+  for (const tool of ["context_list_entries", "context_grep", "context_show_entry"]) {
+    assert(c.summary.includes(tool), "checkpoint explicitly permits bounded fallback tools");
+  }
   assert(c.summary.includes("Re-read documents required by the applicable instructions"));
   assert(c.summary.includes("even if you read them before compaction."));
   assert(c.summary.includes("This means restoring inputs, not repeating completed work: do not redo writes, edits, or other state-changing actions merely because their results were dropped."));
@@ -96,7 +99,7 @@ async function search(ext, ctx, calls, verify = () => {}) {
     complete: async (selectedModel, context, options) => {
       assert.equal(selectedModel, model);
       assert.equal(options.signal, signal);
-      assert.equal(options.cacheRetention, "none");
+      assert(!Object.hasOwn(options, "cacheRetention"), "provider caching defaults are not overridden");
       assert(options.sessionId);
       const declaredTools = context.messages.filter((m) => m.role === "system").flatMap((m) => m.toolsAdded ?? []);
       assert.deepEqual(declaredTools.map((t) => t.name), ["list_entries", "grep", "show_entry"]);
@@ -396,16 +399,17 @@ async function checkpointTests(ext, SessionManager, root) {
 
 async function main() {
   // Make all configuration deterministic and restore the caller's environment.
-  const keys = ["MECH_COMPACT_LOOKUP_SESSION_FILE", "MECH_COMPACT_LOOKUP_MODEL", "MECH_COMPACT_LOOKUP_TURNS", "MECH_COMPACT_MAX_SUMMARY_CHARS", "MECH_COMPACT_MAX_SUMMARY_PERCENT", "MECH_COMPACT_DUMP_DIR", "MECH_COMPACT_WARN_GITIGNORE"];
+  const keys = ["MECH_COMPACT_LOOKUP_MAX_CALLS", "MECH_COMPACT_LOOKUP_SESSION_FILE", "MECH_COMPACT_LOOKUP_MODEL", "MECH_COMPACT_LOOKUP_TURNS", "MECH_COMPACT_MAX_SUMMARY_CHARS", "MECH_COMPACT_MAX_SUMMARY_PERCENT", "MECH_COMPACT_DUMP_DIR", "MECH_COMPACT_WARN_GITIGNORE"];
   const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   keys.forEach((key) => { delete process.env[key]; });
   const mode = process.argv[2] ?? "full";
-  assert(["full", "cap", "caphang", "capspans", "capdefault", "capenv"].includes(mode), `Unknown test mode: ${mode}`);
+  assert(["full", "cap", "caphang", "capspans", "capdefault", "capenv", "lookupenv"].includes(mode), `Unknown test mode: ${mode}`);
   const capBudget = mode === "capspans" ? 800 : mode === "caphang" ? 3000 : 80000;
   if (mode === "capenv") {
     process.env.MECH_COMPACT_MAX_SUMMARY_PERCENT = process.argv[3];
     if (process.argv[5] !== undefined) process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = process.argv[5];
   } else if (mode !== "capdefault") process.env.MECH_COMPACT_MAX_SUMMARY_CHARS = String(capBudget);
+  if (mode === "lookupenv") process.env.MECH_COMPACT_LOOKUP_MAX_CALLS = process.argv[3];
   process.env.MECH_COMPACT_LOOKUP_TURNS = "2";
   process.env.MECH_COMPACT_WARN_GITIGNORE = "0";
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verbatim-compact-test-"));
@@ -413,6 +417,12 @@ async function main() {
     const { SessionManager, loadSkillsFromDir } = await jiti.import("@earendil-works/pi-coding-agent");
     const { default: factory } = await jiti.import(path.join(__dirname, "source", "extensions", "verbatim-compact.ts"));
     const ext = load(factory);
+    const hybridTests = require("./scripts/hybrid-tests.cjs");
+    const hybridHelpers = { ext, SessionManager, root, fixture, makeContext, assistant, text, toolCall, toolText, search, saveSession, output, thinking, argumentsText, user };
+    if (mode === "lookupenv") {
+      await hybridTests.limitTests({ ...hybridHelpers, expected: Number(process.argv[4]) });
+      return;
+    }
     const capPolicyTests = require("./scripts/cap-policy-tests.cjs");
     const capHelpers = { factory, SessionManager, root, load, makeContext, compact, saveSession, user };
     if (mode === "capdefault") {
@@ -427,7 +437,10 @@ async function main() {
       await capTests(ext, SessionManager, root, capBudget);
       return;
     }
-    assert.deepEqual(Object.keys(ext.tools), ["context_lookup"]);
+    assert.deepEqual(Object.keys(ext.tools), ["context_list_entries", "context_grep", "context_show_entry", "context_lookup"]);
+    await hybridTests(hybridHelpers);
+    await require("./scripts/pagination-tests.cjs")(hybridHelpers);
+    await require("./scripts/runtime-lookup-tests.cjs")({ ...hybridHelpers, jiti, piRoot });
     assert.deepEqual(Object.keys(ext.commands), ["compaction-method", "cap-compaction"]);
     await methodTests(factory, SessionManager, root);
     await capPolicyTests(capHelpers);
@@ -443,7 +456,9 @@ async function main() {
     assert(loadedSkills.skills[0].description.includes("context_lookup"));
     const skillText = fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf8");
     assert(skillText.includes("verbatim-compact.ts"));
-    assert(skillText.includes("Only supply `question`"));
+    assert(skillText.includes("only supply `question`"));
+    assert(skillText.includes("Bounded fallback and pagination"));
+    assert(!skillText.includes("Always use `context_lookup`"));
     assert(!skillText.includes("dumpDir"));
     assert(!skillText.includes(".pi/context-dumps/"));
     assert(skillText.includes("Never grep or read session JSONL files"));
@@ -585,25 +600,33 @@ async function main() {
     }
     const thrown = { ...ctx, modelRegistry: { complete: async () => { throw new Error("provider unavailable"); } } };
     assert.equal(toolText(await invoke(thrown)), "context_lookup failed: provider unavailable");
-    for (const failWriteup of [false, true]) {
+    for (const writeupMode of ["success", "throw", "empty", "aborted", "error", "long"]) {
+      const failWriteup = ["throw", "empty", "aborted", "error"].includes(writeupMode);
       let count = 0;
       let sessionId;
       const c = { ...ctx, modelRegistry: { complete: async (_model, context, options) => {
         count++;
         if (!sessionId) sessionId = options.sessionId;
         assert.equal(options.sessionId, sessionId, "subagent cache/session identity stays stable");
+        assert(!Object.hasOwn(options, "cacheRetention"), "write-up and search calls use provider caching defaults");
         if (count <= 2) return response([text("Partial old evidence"), toolCall("grep", { pattern: "EARLIEST_TOOL_OUTPUT_START" }, `turn${count}`)], "toolUse");
         const declaredTools = context.messages.filter((m) => m.role === "system").flatMap((m) => m.toolsAdded ?? []);
         assert.equal(declaredTools.length, 0, "write-up call has no tools");
         assert(JSON.stringify(context.messages.at(-1)).includes("out of search turns"));
-        if (failWriteup) throw new Error("write-up unavailable");
-        return response([text("Final partial findings")]);
+        if (writeupMode === "throw") throw new Error("write-up unavailable");
+        if (writeupMode === "empty") return response([]);
+        if (writeupMode === "aborted" || writeupMode === "error") return response([], writeupMode);
+        return response([text("Final partial findings" + (writeupMode === "long" ? "x".repeat(20000) : ""))]);
       } } };
       const result = toolText(await invoke(c));
       assert.equal(count, 3);
       assert(result.includes("2-turn limit"));
       assert(result.includes(failWriteup ? "Partial old evidence" : "Final partial findings"));
-      if (failWriteup) assert(result.includes("write-up unavailable") && result.includes("findings may be incomplete"));
+      if (failWriteup) assert(result.includes("findings may be incomplete"));
+      if (writeupMode === "throw") assert(result.includes("write-up unavailable"));
+      const note = "If more detail is needed for this query, use context_list_entries, context_grep, or context_show_entry rather than immediately repeating context_lookup.";
+      assert(result.endsWith(note), "next-step guidance survives truncation and write-up failures");
+      assert.equal(result.split(note).length, 2, "fallback note is appended once");
     }
     // Skip empty and cancelled compaction preparations without side effects.
     const skipped = await ext.handlers.session_before_compact({ preparation: { messagesToSummarize: [], turnPrefixMessages: [] }, branchEntries: [], signal: new AbortController().signal }, ctx);

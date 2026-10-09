@@ -120,10 +120,10 @@ tail—not to the opaque summary base.
 
 ### Control the compaction cap
 
-The default is **`warn 25%`**: a conversation-section budget of 25% of the current
-model's context window, using estimated tokens. When content would actually be
-trimmed, choose **Apply trimming**, **Disable cap for this session**, **Change
-budget**, or **Cancel compaction**. Disabling persists as `off`, rather than
+The default is **`warn 25%`**: a conversation-section budget estimated at 25% of
+the current model's context window, using **4 characters per token**, not an
+exact tokenizer. When content would actually be trimmed, choose **Apply trimming**,
+**Disable cap for this session**, **Change budget**, or **Cancel compaction**. Disabling persists as `off`, rather than
 bypassing just once. Cancel or Esc cancels compaction; it does not fall through
 to summary compaction.
 
@@ -157,17 +157,22 @@ still removes thinking and tool outputs and abbreviates tool-call signatures.
 It may leave too much context for the model, particularly during overflow recovery.
 
 With no interactive UI, `warn` emits a warning and applies the cap. TUI and
-supported RPC clients can answer the dialogs. If a percentage cannot be resolved
-because the model's context window is unavailable, compaction is cancelled:
-choose a character/token budget or turn the cap off.
+supported RPC clients can answer the dialogs. In interactive sessions, `warn`
+can wait for an answer even during automatic compaction; use `/cap-compaction on`
+for unattended operation. If a percentage cannot be resolved because the model's
+context window is unavailable, compaction is cancelled: choose a character/token
+budget or turn the cap off.
 
 ### Recover historical details
 
-The extension registers one model-callable tool:
+The extension registers a subagent lookup and three direct-search fallback tools:
 
 | Tool | Purpose |
 |---|---|
 | `context_lookup` | Recover specific historical details from the full raw session branch. Accepts only `question`. |
+| `context_list_entries` | Fallback: list entry ids, roles, timestamps, and previews. |
+| `context_grep` | Fallback: regex-search the raw branch with surrounding lines and entry attribution. |
+| `context_show_entry` | Fallback: retrieve an entry by id. |
 
 For example, ask the agent to recover the build error observed before compaction.
 It can call `context_lookup` with:
@@ -179,7 +184,24 @@ It can call `context_lookup` with:
 ```
 
 The subagent searches in its own context and returns findings with entry
-references. Raw search results stay out of the main conversation. 
+references. Its raw search results stay out of the main conversation. If findings
+are incomplete, the fallback tools run the same searches directly; their results
+enter the main context. Turn-limit write-ups include a note recommending these
+tools for further detail on the same query, even if the write-up fails.
+
+By default, only one `context_lookup` attempt is allowed until a user message,
+a bash execution, or a tool result outside these four recovery tools resets the
+limit. Fallback searches, assistant text, and thinking neither increase nor reset
+the count. Pending lookup calls in the same batch also count, preventing parallel
+calls from bypassing the limit. Blocked attempts return a short fallback note
+without launching a subagent; later lookups after other work remain available.
+
+Search responses are bounded pages, not necessarily complete entries or match
+lists. Follow all reported continuation parameters, keeping other search
+parameters unchanged. Listing and grep cursors include `throughEntry` to keep
+newly appended calls/results from expanding the search while paging. The raw
+history remains complete; oversized entries and individual lines remain
+accessible across pages.
 
 After compaction, the checkpoint instructs the agent to re-read required documents,
 even if previously read, re-acquire missing task information, inspect Git state
@@ -196,6 +218,7 @@ starting Pi:
 | `MECH_COMPACT_MAX_SUMMARY_PERCENT` | `25` | Initial percentage of the model's context window, using estimated tokens. Accepts numbers greater than 0 and at most 100, including decimals; invalid values fall back to 25. |
 | `MECH_COMPACT_LOOKUP_MODEL` | Session model | Optional `provider/modelId` for lookups; must support tool calls and be available in Pi. An unresolved model falls back to the session model. |
 | `MECH_COMPACT_LOOKUP_TURNS` | `10` | Maximum search turns; exhaustion adds one final tool-free write-up call. |
+| `MECH_COMPACT_LOOKUP_MAX_CALLS` | `1` | Maximum consecutive lookup attempts. `0` means unlimited; see [recovery reset rules](#recover-historical-details). Invalid values fall back to 1. |
 | `MECH_COMPACT_LOOKUP_SESSION_FILE` | Unset | Optional absolute path to a full session JSONL, replacing the current branch as the lookup source. Intended for harnesses using pruned forks. |
 
 Cap-budget precedence is **session setting → explicit character setting → percentage setting**.
@@ -213,7 +236,7 @@ Or use a fixed character budget:
 MECH_COMPACT_MAX_SUMMARY_CHARS=40000 pi
 ```
 
-The lookup model, turn budget, and initial cap settings are read when the extension loads.
+The lookup model, turn budget, consecutive-call limit, and initial cap settings are read when the extension loads.
 Use `/cap-compaction` to change the session budget or mode without restarting. The
 session-file override is checked at each lookup. Restart Pi after changing its
 launching environment; `/reload` does not change inherited environment variables.
@@ -316,10 +339,13 @@ attribution.
 
 The subagent uses three internal tools: `list_entries`, `grep`, and `show_entry`.
 These search the rendered lines directly, so no temporary file, second session
-copy, or cleanup is needed. Individual results and the final answer have size
-limits. If the search-turn budget is exhausted, one final tool-free model call
-writes up partial findings; a failed write-up falls back to the latest text,
-explicitly labeled incomplete.
+copy, or cleanup is needed. They share the fallback tools' paginated search
+functions. Individual results and the final answer have size limits. If the
+search-turn budget is exhausted, one final tool-free model call writes up partial
+findings; a failed write-up falls back to the latest text,
+explicitly labeled incomplete. Lookup requests use normal provider caching
+defaults rather than forcing caching off; actual cache behavior and savings vary
+by provider.
 
 ## Local-inference trade-offs
 
@@ -385,9 +411,11 @@ npm test
 
 Tests use synthetic sessions and stubbed model responses, including raw recovery
 across three compactions, branch scoping, override/error behavior, entry
-attribution, size guards, and the bundled skill. No live model, GPU, or credentials
-are required. The suite also exercises Pi's real package and extension loaders
-and checks the packed resources. See [contributing](CONTRIBUTING.md).
+attribution, size guards, pagination, and the bundled skill. Real Pi agent-turn
+tests check tool-call persistence ordering, parallel-call limits, and recovery
+reset rules. No live model, GPU, or credentials are required. The suite also
+exercises Pi's real package and extension loaders and checks the packed resources.
+See [contributing](CONTRIBUTING.md).
 
 ## License
 

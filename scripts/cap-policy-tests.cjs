@@ -64,15 +64,15 @@ module.exports = async function capPolicyTests({ factory, SessionManager, root, 
   await set(defaults, "on 20000t");
   assert.equal(normalise((await attempt(defaults)).compaction.summary), normalise(explicit.compaction.summary), "20000 estimated tokens equals 80000c");
   await set(defaults, "25%");
-  assert(latest(defaults).includes("48,000 estimated tokens; 192,000 chars"));
+  assert(latest(defaults).includes("48,000 estimated tokens at 4 chars/token; 192,000 chars"));
   assert(!(await attempt(defaults)).compaction.summary.includes(huge));
   defaults.ctx.model.contextWindow = 384000;
   await set(defaults, "");
-  assert(latest(defaults).includes("96,000 estimated tokens; 384,000 chars"));
+  assert(latest(defaults).includes("96,000 estimated tokens at 4 chars/token; 384,000 chars"));
   assert((await attempt(defaults)).compaction.summary.includes(huge), "percentage recalculates after model changes");
   defaults.ctx.model.contextWindow = 192001;
   await set(defaults, "12.5%");
-  assert(latest(defaults).includes("24,000 estimated tokens; 96,000 chars"), "fractional percentages round down to whole tokens");
+  assert(latest(defaults).includes("24,000 estimated tokens at 4 chars/token; 96,000 chars"), "fractional percentages round down to whole tokens");
 
   const small = make("Small span");
   interactive(small, () => assert.fail("no prompt unless content would actually be trimmed"));
@@ -232,7 +232,7 @@ module.exports.defaultBudgetTests = async function ({ factory, SessionManager, r
   const command = ext.commands["cap-compaction"];
   const leaf = manager.getLeafId();
   await command.handler("", ctx);
-  assert(notices.at(-1).message.includes("cap: warn; budget 25% (48,000 estimated tokens; 192,000 chars)"));
+  assert(notices.at(-1).message.includes("cap: warn; budget 25% (48,000 estimated tokens at 4 chars/token; 192,000 chars)"));
   assert.equal(manager.getLeafId(), leaf, "fresh defaults require no saved state");
   const attempt = () => ext.handlers.session_before_compact({ reason: "manual", branchEntries: manager.getBranch(),
     signal: new AbortController().signal, preparation: { messagesToSummarize: [manager.getEntry(u).message],
@@ -270,7 +270,7 @@ module.exports.envBudgetTests = async function ({ factory, SessionManager, root,
   const value = Number(expectedBudget.slice(0, -1));
   if (isPercent) {
     const tokens = Math.floor(192000 * value / 100);
-    assert(notices.at(-1).message.includes(`${tokens.toLocaleString()} estimated tokens; ${(tokens * 4).toLocaleString()} chars`));
+    assert(notices.at(-1).message.includes(`${tokens.toLocaleString()} estimated tokens at 4 chars/token; ${(tokens * 4).toLocaleString()} chars`));
     ctx.model.contextWindow = 384000;
     await command.handler("", ctx);
     const switchedTokens = Math.floor(384000 * value / 100);

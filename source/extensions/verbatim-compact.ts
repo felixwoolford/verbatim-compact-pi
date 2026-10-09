@@ -16,6 +16,10 @@
  *   MECH_COMPACT_LOOKUP_MODEL         "provider/modelId" for the lookup subagent
  *   MECH_COMPACT_LOOKUP_TURNS         max search turns (default 10), plus one
  *                                    final write-up when the budget is exhausted
+ *   MECH_COMPACT_LOOKUP_MAX_CALLS     consecutive lookup limit (default 1;
+ *                                    0 = unlimited). Non-recovery tool results,
+ *                                    bash executions, or user messages reset it.
+ *                                    Fallback tools neither count nor reset it.
  *   MECH_COMPACT_LOOKUP_SESSION_FILE  absolute session JSONL path to search
  *                                    instead of the current branch (study override)
  */
@@ -64,13 +68,21 @@ function percentFromEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 && n <= 100 ? n : fallback;
 }
 
+function lookupMaxCallsFromEnv(): number {
+  const raw = process.env.MECH_COMPACT_LOOKUP_MAX_CALLS?.trim();
+  const n = raw && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : 1;
+}
+
 const cfg = {
   defaultCapBudget: (process.env.MECH_COMPACT_MAX_SUMMARY_CHARS
     ? { unit: "chars", value: intFromEnv("MECH_COMPACT_MAX_SUMMARY_CHARS", 80_000) }
     : { unit: "percent", value: percentFromEnv("MECH_COMPACT_MAX_SUMMARY_PERCENT", 25) }) as CapBudget,
   lookupTurns: intFromEnv("MECH_COMPACT_LOOKUP_TURNS", 10),
+  lookupMaxCalls: lookupMaxCallsFromEnv(),
   lookupModel: process.env.MECH_COMPACT_LOOKUP_MODEL?.trim() || undefined,
   argSnippetChars: 160,
+  listMaxChars: 12_000,
   grepMaxChars: 12_000,
   showEntryMaxChars: 24_000,
   lookupAnswerMaxChars: 12_000,
@@ -123,7 +135,7 @@ function capDescription(state: CapSettings, contextWindow?: number): string {
   const chars = capBudgetChars(state.budget, contextWindow);
   const resolved = chars === undefined ? "model context window unavailable" : state.budget.unit === "chars"
     ? `${chars.toLocaleString()} chars`
-    : `${(chars / 4).toLocaleString()} estimated tokens; ${chars.toLocaleString()} chars`;
+    : `${(chars / 4).toLocaleString()} estimated tokens at 4 chars/token; ${chars.toLocaleString()} chars`;
   return `Verbatim compaction cap: ${state.mode}; budget ${capBudgetText(state.budget)} (${resolved}).`;
 }
 
@@ -218,7 +230,7 @@ function textOf(content: unknown): TextOut {
   return { text: "", images: 0 };
 }
 
-function truncateMiddle(text: string, max: number): string {
+function truncateHead(text: string, max: number): string {
   if (text.length <= max) return text;
   const dropped = text.length - max;
   return `${text.slice(0, max)}\n…[+${dropped} chars truncated]`;
@@ -575,7 +587,7 @@ const REORIENT_BLOCK = `**Re-orient before continuing.** Compaction may have rem
 3. Re-read any file you are about to modify — do not trust content you only remember from before the compaction.
 4. **Treat other pre-compaction knowledge as unverified too.** Thinking and tool outputs were removed. Anything you know only from them — or from earlier assistant prose describing them — is a note, not evidence. Before you state it as fact or base a decision on it, re-read the source or ask \`context_lookup\`. If you cannot verify it, say explicitly that it is unverified.
 
-**Recovering dropped details.** Information removed from your active context is preserved in the session. Use \`context_lookup\` to recover relevant details, including earlier thinking and tool outputs. Do NOT grep the session file yourself in this conversation — that would fill your context with raw transcript text. Call the \`context_lookup\` tool with a specific question; a subagent searches the session transcript in its own context and returns only the relevant findings.`;
+**Recovering dropped details.** Information removed from your active context is preserved in the session, including earlier thinking and tool outputs. Prefer \`context_lookup\` with a specific question: a subagent searches the transcript in its own context and returns relevant findings. If its findings are incomplete, use the bounded fallback tools \`context_list_entries\`, \`context_grep\`, and \`context_show_entry\`; follow their pagination instructions for more detail. Do not read or grep raw session JSONL files or old dumps through filesystem tools in this conversation — use these recovery tools instead.`;
 
 async function buildMechanicalSummary(opts: {
   reason: string; // pi's raw reason: "manual" | "threshold" | "overflow"
@@ -705,8 +717,51 @@ function entryAt(lines: string[], idx: number, index: TranscriptIndexEntry[]): {
   return { id: e.id, header: lines[e.startLine - 1] ?? "", section };
 }
 
-function listEntries(transcripts: Transcript[], file?: string): string {
+// Keep page boundaries between Unicode characters, never inside a surrogate pair.
+function characterBoundary(text: string, start: number, end: number): number {
+  const prev = text.charCodeAt(end - 1), next = text.charCodeAt(end);
+  return end > start && prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? end - 1 : end;
+}
+
+// An entry-id boundary pins a paginated listing/search while new tool calls
+// and results append to the branch. It is not a snapshot or a filesystem path.
+function transcriptWindow(transcripts: Transcript[], file?: string, throughEntry?: string): Transcript[] {
   const targets = file ? transcripts.filter((d) => d.name === file) : transcripts;
+  if (!throughEntry) return targets;
+  const bounded: Transcript[] = [];
+  for (const d of targets) {
+    const at = d.index.findIndex((e) => e.id === throughEntry);
+    if (at >= 0) bounded.push({ ...d, lines: d.lines.slice(0, d.index[at].endLine), index: d.index.slice(0, at + 1) });
+  }
+  if (!bounded.length) throw new Error(`Pagination boundary ENTRY "${throughEntry}" is not on this transcript branch. Restart at offset=0 without throughEntry.`);
+  return bounded;
+}
+
+// Offsets count JavaScript string characters (UTF-16 code units), not tokens.
+// Pagination never discards a suffix: even a single enormous physical line is
+// accessible. Only response payloads are capped; small status/cursor notes are extra.
+function pageText(text: string, opts: { offset?: number; maxChars: number; maxLines?: number; attribution: string; continuation?: string }): string {
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  if (offset >= text.length) return `No more content at offset=${offset} (${text.length} total characters).`;
+  let end = Math.min(text.length, offset + opts.maxChars);
+  if (opts.maxLines !== undefined) {
+    let lines = 0;
+    for (let i = offset; i < end; i++) {
+      if (text[i] === "\n" && ++lines >= opts.maxLines) { end = i + 1; break; }
+    }
+  }
+  end = characterBoundary(text, offset, end);
+  const prefix = offset > 0 ? `[Continuation: ${truncateHead(opts.attribution, 1_000)}; offset=${offset}]\n` : "";
+  const body = text.slice(offset, end);
+  const notice = end < text.length
+    ? `\n[Page limited: characters ${offset}–${end - 1} of ${text.length}; ${text.length - end} characters remain. Continue with the same parameters and offset=${end}${opts.continuation ?? ""}.]`
+    : "";
+  return prefix + body + notice;
+}
+
+function listEntries(transcripts: Transcript[], opts: { file?: string; offset?: number; throughEntry?: string } = {}): string {
+  const targets = transcriptWindow(transcripts, opts.file, opts.throughEntry);
+  const throughEntry = targets.length === 1 ? targets[0].index.at(-1)?.id : undefined;
   const parts: string[] = [];
   for (const d of targets) {
     const rows = d.index.map((e) => {
@@ -717,57 +772,109 @@ function listEntries(transcripts: Transcript[], file?: string): string {
     });
     parts.push(`### ${d.name} (${rows.length} entries)\n${rows.join("\n")}`);
   }
-  return parts.join("\n\n") || "(no transcript entries)";
+  return parts.length ? pageText(parts.join("\n\n"), {
+    offset: opts.offset, maxChars: cfg.listMaxChars, attribution: `entry listing for ${targets.map((t) => t.name).join(", ")}`,
+    continuation: throughEntry ? `, throughEntry=${JSON.stringify(throughEntry)}` : "",
+  }) : "(no transcript entries)";
 }
 
-function grepTranscript(transcripts: Transcript[], opts: { pattern: string; file?: string; before?: number; after?: number; maxMatches?: number }): string {
-  const targets = opts.file ? transcripts.filter((d) => d.name === opts.file) : transcripts;
+interface GrepOptions { pattern: string; file?: string; before?: number; after?: number; maxMatches?: number; offset?: number; charOffset?: number; throughEntry?: string }
+function grepTranscript(transcripts: Transcript[], opts: GrepOptions): string {
+  const targets = transcriptWindow(transcripts, opts.file, opts.throughEntry);
+  const throughEntry = targets.length === 1 ? targets[0].index.at(-1)?.id : undefined;
   let re: RegExp;
   try {
     re = new RegExp(opts.pattern, "i");
   } catch {
     re = new RegExp(opts.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
   }
-  const before = Math.max(0, opts.before ?? 2);
-  const after = Math.max(0, opts.after ?? 6);
-  const maxMatches = Math.max(1, opts.maxMatches ?? 15);
+  const before = Math.max(0, Math.floor(opts.before ?? 2));
+  const after = Math.max(0, Math.floor(opts.after ?? 6));
+  const maxMatches = Math.max(1, Math.floor(opts.maxMatches ?? 15));
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+  let charOffset = Math.max(0, Math.floor(opts.charOffset ?? 0));
+  const hits: { transcript: Transcript; line: number }[] = [];
+  for (const d of targets) {
+    for (let i = 0; i < d.lines.length; i++) if (re.test(d.lines[i])) hits.push({ transcript: d, line: i });
+  }
+  if (hits.length === 0) return `No matches for /${opts.pattern}/ in ${targets.map((t) => t.name).join(", ") || "(no transcripts)"}.`;
+  if (offset >= hits.length) return `No more matches at offset=${offset} (${hits.length} total matches).`;
 
   const out: string[] = [];
-  let matches = 0;
-  for (const d of targets) {
-    const hits: number[] = [];
-    for (let i = 0; i < d.lines.length; i++) {
-      if (re.test(d.lines[i])) {
-        hits.push(i);
-        if (hits.length >= maxMatches) break;
-      }
-    }
-    if (hits.length === 0) continue;
-    for (const i of hits) {
-      matches++;
-      const entry = entryAt(d.lines, i, d.index);
-      out.push(`--- ${d.name} line ${i + 1}${entry ? `  << ${entry.header}${entry.section ? `  [${entry.section}]` : ""}` : ""}`);
-      const from = Math.max(0, i - before);
-      const to = Math.min(d.lines.length - 1, i + after);
-      out.push(d.lines.slice(from, to + 1).map((l, n) => (n + from === i ? `>> ${l}` : `   ${l}`)).join("\n"));
-    }
+  let size = 0;
+  let next = offset;
+  for (; next < hits.length && next < offset + maxMatches; next++) {
+    const { transcript: d, line: i } = hits[next];
+    const entry = entryAt(d.lines, i, d.index);
+    const header = truncateHead(`--- ${d.name} line ${i + 1}${entry ? `  << ${entry.header}${entry.section ? `  [${entry.section}]` : ""}` : ""}`, 1_000);
+    const from = Math.max(0, i - before);
+    const to = Math.min(d.lines.length - 1, i + after);
+    const body = d.lines.slice(from, to + 1).map((l, n) => (n + from === i ? `>> ${l}` : `   ${l}`)).join("\n");
+    if (charOffset >= body.length) return `Invalid charOffset=${charOffset} for match offset=${next} (${body.length} characters).`;
+    const prefix = `${header}${charOffset ? `  [match offset=${next}, charOffset=${charOffset}]` : ""}\n`;
+    const available = cfg.grepMaxChars - size - prefix.length - (out.length ? 2 : 0);
+    if (available <= 0) break;
+    const end = characterBoundary(body, charOffset, Math.min(body.length, charOffset + available));
+    if (end === charOffset) break;
+    const chunk = prefix + body.slice(charOffset, end);
+    out.push(chunk);
+    size += chunk.length + (out.length > 1 ? 2 : 0);
+    if (end < body.length) { charOffset = end; break; }
+    charOffset = 0;
   }
-  if (matches === 0) return `No matches for /${opts.pattern}/ in ${targets.map((t) => t.name).join(", ") || "(no transcripts)"}.`;
-  return truncateMiddle(out.join("\n\n"), cfg.grepMaxChars);
+  const notice = next < hits.length
+    ? `\n[Page limited: ${hits.length} total matches; ${hits.length - next} matches remain${charOffset ? " (including the partially shown match)" : ""}. Continue with the same parameters and offset=${next}, charOffset=${charOffset}${throughEntry ? `, throughEntry=${JSON.stringify(throughEntry)}` : ""}.]`
+    : "";
+  return out.join("\n\n") + notice;
 }
 
-function showEntry(transcripts: Transcript[], opts: { id: string; file?: string; maxLines?: number }): string {
+function showEntry(transcripts: Transcript[], opts: { id: string; file?: string; maxLines?: number; offset?: number }): string {
   const targets = opts.file ? transcripts.filter((d) => d.name === opts.file) : transcripts;
-  const maxLines = Math.max(10, opts.maxLines ?? 400);
   const out: string[] = [];
+  const headers: string[] = [];
   for (const d of targets) {
     const e = d.index.find((x) => x.id === opts.id);
     if (!e) continue;
     const block = d.lines.slice(e.startLine - 2, e.endLine); // includes the rule before the header
-    const shown = block.slice(0, maxLines);
-    out.push(`### ${d.name}\n${shown.join("\n")}${block.length > maxLines ? `\n…[+${block.length - maxLines} more lines — grep with more context or re-call]` : ""}`);
+    out.push(`### ${d.name}\n${block.join("\n")}`);
+    headers.push(`${d.name}: ${d.lines[e.startLine - 1]}`);
   }
-  return out.length > 0 ? truncateMiddle(out.join("\n\n"), cfg.showEntryMaxChars) : `No entry with id "${opts.id}" found.`;
+  return out.length ? pageText(out.join("\n\n"), {
+    offset: opts.offset, maxChars: cfg.showEntryMaxChars,
+    maxLines: Math.max(1, Math.floor(opts.maxLines ?? 400)), attribution: headers.join("; "),
+  }) : `No entry with id "${opts.id}" found.`;
+}
+
+// Identical paging parameters in the subagent and direct tools; only the
+// subagent accepts a logical transcript name (not a filesystem path).
+const OFFSET_FIELD = Type.Optional(Type.Integer({ minimum: 0, description: "Character offset (UTF-16 units, default 0). Use the next offset reported by the previous page." }));
+const FILE_FIELD = Type.Optional(Type.String({ description: "Logical transcript name. Omit for all." }));
+const THROUGH_ENTRY_FIELD = Type.Optional(Type.String({ description: "Last ENTRY id included in this paginated listing/search. Keep the reported throughEntry on subsequent pages to exclude newly appended calls/results; omit to start a fresh search." }));
+const LIST_FIELDS = { offset: OFFSET_FIELD, throughEntry: THROUGH_ENTRY_FIELD };
+const GREP_FIELDS = {
+  pattern: Type.String({ description: "JS regex, case-insensitive" }),
+  before: Type.Optional(Type.Integer({ minimum: 0, description: "Context lines before (default 2)" })),
+  after: Type.Optional(Type.Integer({ minimum: 0, description: "Context lines after (default 6)" })),
+  maxMatches: Type.Optional(Type.Integer({ minimum: 1, description: "Max matches per page (default 15); character limit also applies" })),
+  offset: Type.Optional(Type.Integer({ minimum: 0, description: "Match offset (0-based, default 0). Use the next offset reported by the previous page." })),
+  charOffset: Type.Optional(Type.Integer({ minimum: 0, description: "Character offset within that match's context (default 0). Use with offset to continue a partially shown match." })),
+  throughEntry: THROUGH_ENTRY_FIELD,
+};
+const SHOW_FIELDS = {
+  id: Type.String({ description: "Entry id" }),
+  maxLines: Type.Optional(Type.Integer({ minimum: 1, description: "Max lines per page (default 400); character limit also applies" })),
+  offset: OFFSET_FIELD,
+};
+
+const LOOKUP_FALLBACK_NOTE =
+  "If more detail is needed for this query, use context_list_entries, context_grep, or context_show_entry rather than immediately repeating context_lookup.";
+
+// Append outside the truncated findings so the next-step guidance survives
+// even a long write-up. Normal successful answers remain unchanged.
+function lookupPartialFindings(text: string, marker: string): string {
+  const status = truncateHead(marker, 1_000); // Provider error messages can be large too.
+  const budget = cfg.lookupAnswerMaxChars - status.length - LOOKUP_FALLBACK_NOTE.length - 2;
+  return `${truncateHead(text, budget)}\n${status}\n${LOOKUP_FALLBACK_NOTE}`;
 }
 
 const LOOKUP_WRITEUP_PROMPT =
@@ -777,9 +884,11 @@ const LOOKUP_WRITEUP_PROMPT =
 const LOOKUP_SYSTEM_PROMPT = `You are a context-lookup subagent for a coding agent whose main context was compacted by verbatim compaction. The full pre-compaction transcript — including assistant thinking blocks and complete tool outputs that were REMOVED from the main context — is in the transcript files named in the request.
 
 You have three tools:
-- list_entries: overview of every entry (id, role, timestamp, preview)
-- grep: search the transcript; matches come with surrounding lines and the ENTRY header they belong to
-- show_entry: print one full entry block by entry id
+- list_entries: paginated overview of entries (id, role, timestamp, preview)
+- grep: paginated transcript search; matches come with surrounding lines and authoritative ENTRY attribution
+- show_entry: retrieve an entry by id in bounded pages
+
+Search tools bound each response, not the underlying history. If a page is limited, follow its continuation parameters to retrieve later matches or the rest of an entry, including oversized single lines. A partial page is not the entire evidence.
 
 Work efficiently: start with list_entries if you don't know where to look, then grep for concrete terms, then show_entry for exact content. When you are confident you have what is needed, stop calling tools and output your final answer as plain text.
 
@@ -802,35 +911,23 @@ async function runLookupSubagent(opts: {
   registry: ModelRegistry;
   signal: AbortSignal | undefined;
 }): Promise<string> {
-  const toc = truncateMiddle(listEntries(opts.transcripts).split("\n").slice(0, 60).join("\n"), 4_000);
+  const toc = truncateHead(listEntries(opts.transcripts).split("\n").slice(0, 60).join("\n"), 4_000);
 
   const tools: AiTool[] = [
     {
       name: "list_entries",
-      description: "List every ENTRY header in the transcript (id, role, timestamp, first-line preview). Optional `file` restricts to a transcript name.",
-      parameters: Type.Object({
-        file: Type.Optional(Type.String({ description: "Transcript name (see transcript file list). Omit for all." })),
-      }),
+      description: "List ENTRY headers and previews in pages of up to 12000 payload characters, plus cursor notes. Follow all reported continuation parameters (offset and throughEntry). Optional file restricts to a logical transcript name.",
+      parameters: Type.Object({ ...LIST_FIELDS, file: FILE_FIELD }),
     },
     {
       name: "grep",
-      description: "Regex-search the transcript lines. Returns matching lines with surrounding context and entry attribution. `pattern` is a JS regex (case-insensitive).",
-      parameters: Type.Object({
-        pattern: Type.String({ description: "JS regex, case-insensitive" }),
-        file: Type.Optional(Type.String({ description: "Transcript name. Omit for all." })),
-        before: Type.Optional(Type.Number({ description: "Context lines before (default 2)" })),
-        after: Type.Optional(Type.Number({ description: "Context lines after (default 6)" })),
-        maxMatches: Type.Optional(Type.Number({ description: "Max matches per file (default 15)" })),
-      }),
+      description: "Regex-search transcript lines with surrounding context and authoritative entry attribution. Up to 12000 payload characters per page, plus cursor notes. Follow all reported continuation parameters (offset, charOffset, throughEntry) for remaining matches or oversized lines. pattern is a JS regex (case-insensitive).",
+      parameters: Type.Object({ ...GREP_FIELDS, file: FILE_FIELD }),
     },
     {
       name: "show_entry",
-      description: "Print one full entry block by its ENTRY id (from list_entries or grep attribution).",
-      parameters: Type.Object({
-        id: Type.String({ description: "Entry id" }),
-        file: Type.Optional(Type.String({ description: "Transcript name. Omit for all." })),
-        maxLines: Type.Optional(Type.Number({ description: "Max lines to return (default 400)" })),
-      }),
+      description: "Retrieve an indexed entry by ENTRY id in pages of up to 24000 payload characters and maxLines lines, plus attribution/cursor notes. Follow the reported offset for the rest; a page may not contain the entire entry.",
+      parameters: Type.Object({ ...SHOW_FIELDS, file: FILE_FIELD }),
     },
   ];
 
@@ -850,7 +947,7 @@ async function runLookupSubagent(opts: {
     try {
       switch (name) {
         case "list_entries":
-          return listEntries(opts.transcripts, args.file);
+          return listEntries(opts.transcripts, args);
         case "grep":
           return grepTranscript(opts.transcripts, args);
         case "show_entry":
@@ -869,7 +966,7 @@ async function runLookupSubagent(opts: {
     const resp = await opts.registry.complete(
       opts.model,
       normalizeContext({ systemPrompt: LOOKUP_SYSTEM_PROMPT, messages, tools }),
-      { signal: opts.signal, cacheRetention: "none", sessionId, maxTokens: 4096 },
+      { signal: opts.signal, sessionId, maxTokens: 4096 },
     );
     if (resp.stopReason === "aborted") return "(lookup subagent aborted)";
     if (resp.stopReason === "error") return `(lookup subagent error: ${resp.errorMessage ?? "unknown"})`;
@@ -879,7 +976,7 @@ async function runLookupSubagent(opts: {
     if (text) lastText = text;
 
     if (toolCalls.length === 0) {
-      return truncateMiddle(text || "(subagent returned no answer)", cfg.lookupAnswerMaxChars);
+      return truncateHead(text || "(subagent returned no answer)", cfg.lookupAnswerMaxChars);
     }
 
     messages.push(resp);
@@ -906,19 +1003,19 @@ async function runLookupSubagent(opts: {
     const resp = await opts.registry.complete(
       opts.model,
       normalizeContext({ systemPrompt: LOOKUP_SYSTEM_PROMPT, messages }),
-      { signal: opts.signal, cacheRetention: "none", sessionId, maxTokens: 4096 },
+      { signal: opts.signal, sessionId, maxTokens: 4096 },
     );
     const text = resp.stopReason === "aborted" || resp.stopReason === "error" ? "" : contentText(resp.content);
-    if (text) return truncateMiddle(`${text}\n${marker}`, cfg.lookupAnswerMaxChars);
+    if (text) return lookupPartialFindings(text, marker);
   } catch (err) {
     writeupError = errMsg(err);
   }
   const why = writeupError ? `; write-up failed: ${writeupError}` : "";
-  return truncateMiddle(`${lastText}\n[subagent reached the ${cfg.lookupTurns}-turn limit; findings may be incomplete${why}]`, cfg.lookupAnswerMaxChars);
+  return lookupPartialFindings(lastText, `[subagent reached the ${cfg.lookupTurns}-turn limit; findings may be incomplete${why}]`);
 }
 
 // ============================================================================
-// Session-backed transcript (rendered only when context_lookup is called)
+// Session-backed transcript (rendered only when a recovery tool is called)
 // ============================================================================
 
 function sessionTranscript(ctx: { sessionManager: { getBranch: () => SessionEntry[] } }): Transcript {
@@ -938,6 +1035,83 @@ function sessionTranscript(ctx: { sessionManager: { getBranch: () => SessionEntr
   }
   const { lines, index } = branchToTranscript(entries);
   return { name: "session", file: "session", lines, index };
+}
+
+// ============================================================================
+// Main-agent fallback: the same transcript search functions as the subagent
+// ============================================================================
+
+const FALLBACK_TOOL_NAMES = new Set(["context_list_entries", "context_grep", "context_show_entry"]);
+
+/** Count prior lookup attempts since the last user/ordinary-work/bash boundary.
+ * Fallback results, text, and thinking neither increase nor reset the count. Deduplicate call/result ids, and include
+ * earlier siblings in the current assistant message even before results exist:
+ * two parallel lookups cannot both claim the first slot. Later siblings are
+ * excluded. Raw branch state follows reload, resume, compaction, and forks. */
+function consecutiveLookups(ctx: { sessionManager: { getBranch: () => SessionEntry[] } }, toolCallId: string): number {
+  const entries = ctx.sessionManager.getBranch();
+  const calls = new Set<string>();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.type !== "message") continue;
+    const m = e.message;
+    if (m.role === "user" || m.role === "bashExecution") break;
+    if (m.role === "toolResult") {
+      if (FALLBACK_TOOL_NAMES.has(m.toolName)) continue;
+      if (m.toolName !== "context_lookup") break;
+      calls.add(m.toolCallId);
+    } else if (m.role === "assistant") {
+      for (const b of m.content) {
+        if (b.type !== "toolCall") continue;
+        if (b.id === toolCallId) break;
+        if (b.name === "context_lookup") calls.add(b.id);
+      }
+    }
+  }
+  return calls.size;
+}
+
+function registerDirectTools(pi: ExtensionAPI): void {
+  const pre = "Fallback after context_lookup, when its findings are incomplete: ";
+  const run = (ctx: { sessionManager: { getBranch: () => SessionEntry[] } }, f: (t: Transcript[]) => string) => {
+    try {
+      const transcript = sessionTranscript(ctx);
+      if (transcript.index.length === 0) return { content: [{ type: "text" as const, text: "No entries found on the session branch." }], details: undefined };
+      return { content: [{ type: "text" as const, text: f([transcript]) }], details: undefined };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Tool error: ${errMsg(err)}` }], details: undefined };
+    }
+  };
+  pi.registerTool({
+    name: "context_list_entries",
+    label: "Context: list entries",
+    description: pre + "List raw session ENTRY headers and previews, including compacted entries, in pages of up to 12000 payload characters, plus cursor notes. Follow all reported continuation parameters (offset and throughEntry).",
+    promptSnippet: "Fallback: list session entries when subagent findings are incomplete",
+    parameters: Type.Object(LIST_FIELDS),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return run(ctx, (t) => listEntries(t, params));
+    },
+  });
+  pi.registerTool({
+    name: "context_grep",
+    label: "Context: grep",
+    description: pre + "Regex-search the full raw session branch, including compacted thinking and tool outputs, with surrounding lines and authoritative entry attribution. pattern is a JS regex (case-insensitive). Up to 12000 payload characters per page, plus cursor notes. Follow all reported continuation parameters (offset, charOffset, throughEntry) for remaining matches or oversized lines. Historical thinking is not verified fact.",
+    promptSnippet: "Fallback: search session evidence when subagent findings are incomplete",
+    parameters: Type.Object(GREP_FIELDS),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return run(ctx, (t) => grepTranscript(t, params));
+    },
+  });
+  pi.registerTool({
+    name: "context_show_entry",
+    label: "Context: show entry",
+    description: pre + "Retrieve an indexed session entry by ENTRY id (from context_list_entries or context_grep) in pages of up to 24000 payload characters and maxLines lines, plus attribution/cursor notes. Follow the reported offset for the rest; a page may not contain the entire entry.",
+    promptSnippet: "Fallback: retrieve session entry pages when subagent findings are incomplete",
+    parameters: Type.Object(SHOW_FIELDS),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return run(ctx, (t) => showEntry(t, params));
+    },
+  });
 }
 
 // ============================================================================
@@ -1122,16 +1296,24 @@ export default function (pi: ExtensionAPI) {
   // --------------------------------------------------------------------------
   // context_lookup tool: subagent research over the raw session branch
   // --------------------------------------------------------------------------
+  registerDirectTools(pi);
   pi.registerTool({
     name: "context_lookup",
     label: "Context lookup",
+    executionMode: "sequential",
     description:
-      "Recover information preserved in the session but removed from your active context by verbatim compaction—including thinking, tool outputs, error text, file contents, and earlier decisions. Spawns a subagent that searches the full raw session branch (across all compactions) in its OWN context and returns only relevant findings. Does not search abandoned branches or other sessions. Do NOT grep the session file yourself in the main conversation.",
+      "Recover information preserved in the session but removed from your active context by verbatim compaction—including thinking, tool outputs, error text, file contents, and earlier decisions. Spawns a subagent that searches the full raw session branch (across all compactions) in its OWN context and returns only relevant findings. Does not search abandoned branches or other sessions. Prefer this tool first; if findings are incomplete, use the bounded context_list_entries, context_grep, and context_show_entry fallback tools. Follow their pagination instructions. Do not read or grep raw session JSONL files or old dumps through filesystem tools. Repeated lookup calls without a non-recovery tool result, user message, or bash execution are limited. The three fallback tools neither increase nor reset the lookup count; narration and thinking do not reset it either.",
     promptSnippet: "Ask a subagent to research dropped context in the session transcript",
     parameters: Type.Object({
       question: Type.String({ description: "What to find in the dropped context. Be specific (exact error text, file, decision, command output…)." }),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      if (cfg.lookupMaxCalls > 0 && consecutiveLookups(ctx, toolCallId) >= cfg.lookupMaxCalls) {
+        return {
+          content: [{ type: "text", text: `context_lookup consecutive-call limit reached (${cfg.lookupMaxCalls}). ${LOOKUP_FALLBACK_NOTE}` }],
+          details: undefined,
+        };
+      }
       let model: Model | undefined;
       if (cfg.lookupModel) {
         const slash = cfg.lookupModel.indexOf("/");

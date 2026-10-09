@@ -83,6 +83,10 @@ resolve against the current model's token context window, rounding down to whole
 tokens (minimum one), then converting to characters. Thus 25% of 192,000 tokens
 is 48,000 estimated tokens or 192,000 characters. Resolution at compaction time
 ensures model switches affect subsequent compactions without rewriting settings.
+The percentage is an estimate, not a tokenizer-enforced fraction: at 3.3–3.4
+characters per token, nominal 25% occupies roughly 29–30% in actual tokens.
+Use an explicit character budget for a calibrated workload; the conversion
+factor is not changed based on one workload.
 
 `on` trims without prompting; `off` leaves span lines uncapped. `warn` prompts
 only when the existing cap algorithm would actually remove or shorten span
@@ -91,7 +95,10 @@ can apply trimming, persist `off`, change the session budget and recheck, or
 cancel compaction. Esc, abort, and dialog failures cancel instead of falling
 through to Pi's summary compaction. No interactive UI means warn and apply the
 cap; supported RPC clients can answer the dialogs. An unresolved percentage
-cancels with an error rather than guessing a budget.
+cancels with an error rather than guessing a budget. Automatic threshold/overflow
+compactions in interactive `warn` mode can wait for input indefinitely. For
+unattended runs, select `/cap-compaction on` before starting. There is no silent
+timeout-to-trim policy, and the default remains `warn`.
 
 When span content exceeds the available budget, the extension:
 
@@ -172,12 +179,82 @@ The default budget is ten search turns, with up to 4,096 output tokens per model
 call. Exhaustion adds one tool-free call asking for partial findings. If that call
 fails or returns no text, the latest assistant text is returned with an
 incomplete-findings marker. Search responses and final answers have character
-guards. Cancellation is passed through to model calls.
+guards. Cancellation is passed through to model calls. Each lookup has a separate,
+stable session id across its search and write-up calls. The extension does not
+force `cacheRetention: "none"`; normal provider caching defaults apply, without
+guaranteeing cache hits or discounts on every provider.
 
 Findings should distinguish user instructions, observed tool output, and
 historical reasoning. A past observation is not proof of current state. Recovery
 still depends on model behavior, query scope, and output limits. Only final
 findings reach the main agent; intermediate searches do not enter its context.
+
+The extension appends a deterministic fallback note to turn-limit findings,
+including when the final write-up fails or returns no text. It recommends
+`context_list_entries`, `context_grep`, and `context_show_entry` for more detail
+on the same query. Ordinary successful lookup answers are unchanged.
+
+These three tools run the subagent's existing search functions in the main
+agent, using the same call-time raw branch or session-file override. Their
+results enter the main context; no model or transcript dump is needed. Their
+descriptions mark them as fallbacks. The checkpoint, lookup description, and
+bundled skill prefer `context_lookup`, explicitly permit these bounded tools
+when findings are incomplete, and prohibit raw session JSONL/dump recovery
+through filesystem tools. This is an intentional prompting change, not the
+unchanged study-arm prompt.
+
+As a safety net, `MECH_COMPACT_LOOKUP_MAX_CALLS` defaults to 1 consecutive lookup
+(0 disables the limit). The count is reconstructed from lookup calls/results on
+the active branch, not the override source or cached state. Their ids are counted
+once; earlier pending sibling calls in the current assistant message also count,
+so parallel calls cannot each take the first slot. Lookup tools request sequential
+execution on Pi versions supporting that property, allowing an ordinary-work
+result between calls to reset the streak deterministically. The three fallback
+tools neither increase nor reset the count: direct searches belong to the same
+recovery episode, so `lookup → grep → lookup` cannot repeatedly launch subagents.
+Narration, thinking, and session metadata never reset it either. Only a user
+message, a result outside the four recovery tools, or a bash execution resets
+it. This is an operational recovery-episode boundary, not semantic detection
+of whether two queries concern the same need. A blocked call returns a short fallback note without
+launching a subagent. Later lookups after other work remain available within the
+same user request, respecting resume, reload, compaction, and branch navigation.
+
+## Bounded search and pagination
+
+The raw transcript remains complete. Grep/entry retrieval retain their existing
+12,000/24,000-character payload limits; listings now have a 12,000-character
+payload limit too. Attribution and small cursor/status notes sit outside these
+payload limits. Shared functions and schemas provide the same pagination to the
+subagent and main-agent fallback tools.
+
+- `list_entries` / `context_list_entries`: `offset` is a character offset into
+  the rendered listing (default 0).
+- `show_entry` / `context_show_entry`: `offset` is a character offset into the
+  rendered entry (default 0). `maxLines` is a per-page line budget (default 400,
+  minimum 1), with the independent character guard still applied. Continuations
+  repeat authoritative entry attribution, even when they start inside a line.
+- `grep` / `context_grep`: all matches are counted, not silently cut at the first
+  15. `maxMatches` limits each page (default 15), and `offset` is the zero-based
+  match index. If a match's surrounding context exceeds the remaining character
+  budget, the response reports both `offset` and `charOffset` for continuing that
+  match, repeating its authoritative entry/section attribution. Notices report
+  how many matches remain, including a partially shown match.
+
+Character offsets use JavaScript UTF-16 code units, not bytes or tokens. Limited
+pages print exact continuation parameters; keep other parameters unchanged.
+The source is rendered on every invocation without snapshots. Listing/grep
+continuations include `throughEntry`, the original last entry id, to keep the
+source boundary and listing count stable as new calls/results append. Without
+that boundary a broad search could keep finding its own paginated responses.
+A missing boundary fails explicitly rather than silently widening the search.
+Changing branches or search/context parameters requires restarting at offset 0
+without `throughEntry`. Page boundaries do not split UTF-16 surrogate pairs.
+Pagination exposes oversized individual lines without removing the output guard.
+
+`truncateHead` (formerly misleadingly named `truncateMiddle`) is still used for
+short previews, attribution/status guards, and final subagent findings. Its
+truncation notice reports omitted characters. Retrieval pages use continuation
+instead of permanently hiding a suffix.
 
 The subagent does not inherit the main agent's skill inventory. Its instructions
 come directly from the extension. The bundled skill supplies complementary
@@ -185,9 +262,9 @@ workflow guidance, not a required lookup runtime component.
 
 ## Configuration and compatibility
 
-Model selection, turn budget, and size guard are read at extension load. The
-session-file override is read at lookup time. There is no extension-specific JSON
-configuration or automatic `.env` loading. Pi's own compaction settings control
+Model selection, turn budget, consecutive-call limit, and size guard are read at
+extension load. The session-file override is read at lookup time. There is no
+extension-specific JSON configuration or automatic `.env` loading. Pi's own compaction settings control
 when compaction occurs and how much recent context is retained.
 
 `dump_context`, `/dump-context`, and `dumpDir` are not exposed. Old dump roots and
