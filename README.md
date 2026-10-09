@@ -59,7 +59,9 @@ so only one copy loads. Replace older copies of **both** resources when updating
 From the checkout directory:
 
 ```bash
-cp -r source/* ~/.pi/agent/
+mkdir -p ~/.pi/agent/extensions ~/.pi/agent/skills
+cp extensions/verbatim-compact.ts ~/.pi/agent/extensions/
+cp -r skills/context-retrieval ~/.pi/agent/skills/
 ```
 
 Then `/reload`. Project equivalents are `.pi/extensions/` and `.pi/skills/`.

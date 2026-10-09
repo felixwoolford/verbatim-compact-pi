@@ -4,6 +4,14 @@
   "private": true,
   "description": "Deterministic, verbatim-preserving compaction for Pi, with session-backed subagent context recovery.",
   "license": "MIT",
+  "homepage": "https://github.com/felixwoolford/verbatim-compact-pi#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/felixwoolford/verbatim-compact-pi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/felixwoolford/verbatim-compact-pi/issues"
+  },
   "type": "module",
   "keywords": [
     "pi-package",
@@ -15,15 +23,16 @@
     "node": ">=22.19.0"
   },
   "files": [
-    "source/extensions/",
-    "source/skills/context-retrieval/",
+    "extensions/",
+    "skills/context-retrieval/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "docs/"
   ],
   "pi": {
-    "extensions": ["./source/extensions/verbatim-compact.ts"],
-    "skills": ["./source/skills/context-retrieval"]
+    "extensions": ["./extensions/verbatim-compact.ts"],
+    "skills": ["./skills/context-retrieval"]
   },
   "scripts": {
     "test": "node scripts/test-all.cjs",

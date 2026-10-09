@@ -415,7 +415,7 @@ async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verbatim-compact-test-"));
   try {
     const { SessionManager, loadSkillsFromDir } = await jiti.import("@earendil-works/pi-coding-agent");
-    const { default: factory } = await jiti.import(path.join(__dirname, "source", "extensions", "verbatim-compact.ts"));
+    const { default: factory } = await jiti.import(path.join(__dirname, "extensions", "verbatim-compact.ts"));
     const ext = load(factory);
     const hybridTests = require("./scripts/hybrid-tests.cjs");
     const hybridHelpers = { ext, SessionManager, root, fixture, makeContext, assistant, text, toolCall, toolText, search, saveSession, output, thinking, argumentsText, user };
@@ -449,7 +449,7 @@ async function main() {
     assert(!ext.tools.context_lookup.description.includes(".pi/context-dumps"));
 
     console.log("== Skill validates and matches the session-backed tool contract ==");
-    const skillDir = path.join(__dirname, "source", "skills", "context-retrieval");
+    const skillDir = path.join(__dirname, "skills", "context-retrieval");
     const loadedSkills = loadSkillsFromDir({ dir: skillDir, source: "test" });
     assert.deepEqual(loadedSkills.diagnostics, []);
     assert.equal(loadedSkills.skills.length, 1);

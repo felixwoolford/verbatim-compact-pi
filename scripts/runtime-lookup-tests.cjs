@@ -14,7 +14,7 @@ module.exports = async function runtimeLookupTests(h) {
   console.log("== Real Pi turns: assistant persistence, narration, same-batch limits, and parallel compatibility ==");
   for (const sequential of [true, false]) {
     const manager = SessionManager.inMemory(root);
-    const loaded = await loadExtensions([path.resolve(__dirname, "../source/extensions/verbatim-compact.ts")], root);
+    const loaded = await loadExtensions([path.resolve(__dirname, "../extensions/verbatim-compact.ts")], root);
     assert.deepEqual(loaded.errors, []);
     const definition = loaded.extensions[0].tools.get("context_lookup").definition;
     assert.equal(definition.executionMode, "sequential");
