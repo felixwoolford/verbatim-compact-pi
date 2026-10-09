@@ -14,8 +14,10 @@
  *   MECH_COMPACT_MAX_SUMMARY_CHARS    initial character budget override (takes precedence over percent)
  *   MECH_COMPACT_MAX_SUMMARY_PERCENT  initial percentage of model context (default 25; >0, <=100)
  *   MECH_COMPACT_LOOKUP_MODEL         "provider/modelId" for the lookup subagent
- *   MECH_COMPACT_LOOKUP_TURNS         max search turns (default 10), plus one
- *                                    final write-up when the budget is exhausted
+ *   MECH_COMPACT_LOOKUP_TURNS         max substantive search turns (default 10).
+ *                                    Valid continuation-only turns are exempt;
+ *                                    total search-phase calls capped at 3x this,
+ *                                    plus one final write-up on exhaustion
  *   MECH_COMPACT_LOOKUP_MAX_CALLS     consecutive lookup limit (default 1;
  *                                    0 = unlimited). Non-recovery tool results,
  *                                    bash executions, or user messages reset it.
@@ -733,14 +735,17 @@ function transcriptWindow(transcripts: Transcript[], file?: string, throughEntry
     const at = d.index.findIndex((e) => e.id === throughEntry);
     if (at >= 0) bounded.push({ ...d, lines: d.lines.slice(0, d.index[at].endLine), index: d.index.slice(0, at + 1) });
   }
-  if (!bounded.length) throw new Error(`Pagination boundary ENTRY "${throughEntry}" is not on this transcript branch. Restart at offset=0 without throughEntry.`);
+  if (!bounded.length) throw new Error(`Pagination boundary ENTRY "${throughEntry}" is not on this transcript branch. Restart at offset=0 (and charOffset=0 for grep) without throughEntry.`);
   return bounded;
 }
 
 // Offsets count JavaScript string characters (UTF-16 code units), not tokens.
 // Pagination never discards a suffix: even a single enormous physical line is
 // accessible. Only response payloads are capped; small status/cursor notes are extra.
-function pageText(text: string, opts: { offset?: number; maxChars: number; maxLines?: number; attribution: string; continuation?: string }): string {
+interface PageCursor { offset: number; charOffset?: number; throughEntry?: string }
+type OnContinuation = (cursor: PageCursor) => void;
+
+function pageText(text: string, opts: { offset?: number; maxChars: number; maxLines?: number; attribution: string; continuation?: string; onContinuation?: OnContinuation }): string {
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
   if (offset >= text.length) return `No more content at offset=${offset} (${text.length} total characters).`;
   let end = Math.min(text.length, offset + opts.maxChars);
@@ -756,10 +761,11 @@ function pageText(text: string, opts: { offset?: number; maxChars: number; maxLi
   const notice = end < text.length
     ? `\n[Page limited: characters ${offset}–${end - 1} of ${text.length}; ${text.length - end} characters remain. Continue with the same parameters and offset=${end}${opts.continuation ?? ""}.]`
     : "";
+  if (end < text.length && end > offset) opts.onContinuation?.({ offset: end });
   return prefix + body + notice;
 }
 
-function listEntries(transcripts: Transcript[], opts: { file?: string; offset?: number; throughEntry?: string } = {}): string {
+function listEntries(transcripts: Transcript[], opts: { file?: string; offset?: number; throughEntry?: string } = {}, onContinuation?: OnContinuation): string {
   const targets = transcriptWindow(transcripts, opts.file, opts.throughEntry);
   const throughEntry = targets.length === 1 ? targets[0].index.at(-1)?.id : undefined;
   const parts: string[] = [];
@@ -775,11 +781,12 @@ function listEntries(transcripts: Transcript[], opts: { file?: string; offset?: 
   return parts.length ? pageText(parts.join("\n\n"), {
     offset: opts.offset, maxChars: cfg.listMaxChars, attribution: `entry listing for ${targets.map((t) => t.name).join(", ")}`,
     continuation: throughEntry ? `, throughEntry=${JSON.stringify(throughEntry)}` : "",
+    onContinuation: (cursor) => onContinuation?.({ ...cursor, throughEntry }),
   }) : "(no transcript entries)";
 }
 
 interface GrepOptions { pattern: string; file?: string; before?: number; after?: number; maxMatches?: number; offset?: number; charOffset?: number; throughEntry?: string }
-function grepTranscript(transcripts: Transcript[], opts: GrepOptions): string {
+function grepTranscript(transcripts: Transcript[], opts: GrepOptions, onContinuation?: OnContinuation): string {
   const targets = transcriptWindow(transcripts, opts.file, opts.throughEntry);
   const throughEntry = targets.length === 1 ? targets[0].index.at(-1)?.id : undefined;
   let re: RegExp;
@@ -792,7 +799,8 @@ function grepTranscript(transcripts: Transcript[], opts: GrepOptions): string {
   const after = Math.max(0, Math.floor(opts.after ?? 6));
   const maxMatches = Math.max(1, Math.floor(opts.maxMatches ?? 15));
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
-  let charOffset = Math.max(0, Math.floor(opts.charOffset ?? 0));
+  const startCharOffset = Math.max(0, Math.floor(opts.charOffset ?? 0));
+  let charOffset = startCharOffset;
   const hits: { transcript: Transcript; line: number }[] = [];
   for (const d of targets) {
     for (let i = 0; i < d.lines.length; i++) if (re.test(d.lines[i])) hits.push({ transcript: d, line: i });
@@ -810,7 +818,7 @@ function grepTranscript(transcripts: Transcript[], opts: GrepOptions): string {
     const from = Math.max(0, i - before);
     const to = Math.min(d.lines.length - 1, i + after);
     const body = d.lines.slice(from, to + 1).map((l, n) => (n + from === i ? `>> ${l}` : `   ${l}`)).join("\n");
-    if (charOffset >= body.length) return `Invalid charOffset=${charOffset} for match offset=${next} (${body.length} characters).`;
+    if (charOffset >= body.length) return `Invalid charOffset=${charOffset} for match offset=${next}: the current rendered context has only ${body.length} characters. charOffset is valid only with the same pattern, file, before/after, and throughEntry as the page that issued it. Restart this match at offset=${next} with charOffset=0, keeping your intended search/context parameters.`;
     const prefix = `${header}${charOffset ? `  [match offset=${next}, charOffset=${charOffset}]` : ""}\n`;
     const available = cfg.grepMaxChars - size - prefix.length - (out.length ? 2 : 0);
     if (available <= 0) break;
@@ -825,10 +833,13 @@ function grepTranscript(transcripts: Transcript[], opts: GrepOptions): string {
   const notice = next < hits.length
     ? `\n[Page limited: ${hits.length} total matches; ${hits.length - next} matches remain${charOffset ? " (including the partially shown match)" : ""}. Continue with the same parameters and offset=${next}, charOffset=${charOffset}${throughEntry ? `, throughEntry=${JSON.stringify(throughEntry)}` : ""}.]`
     : "";
+  if (next < hits.length && (next > offset || charOffset > startCharOffset)) {
+    onContinuation?.({ offset: next, charOffset, throughEntry });
+  }
   return out.join("\n\n") + notice;
 }
 
-function showEntry(transcripts: Transcript[], opts: { id: string; file?: string; maxLines?: number; offset?: number }): string {
+function showEntry(transcripts: Transcript[], opts: { id: string; file?: string; maxLines?: number; offset?: number }, onContinuation?: OnContinuation): string {
   const targets = opts.file ? transcripts.filter((d) => d.name === opts.file) : transcripts;
   const out: string[] = [];
   const headers: string[] = [];
@@ -841,7 +852,7 @@ function showEntry(transcripts: Transcript[], opts: { id: string; file?: string;
   }
   return out.length ? pageText(out.join("\n\n"), {
     offset: opts.offset, maxChars: cfg.showEntryMaxChars,
-    maxLines: Math.max(1, Math.floor(opts.maxLines ?? 400)), attribution: headers.join("; "),
+    maxLines: Math.max(1, Math.floor(opts.maxLines ?? 400)), attribution: headers.join("; "), onContinuation,
   }) : `No entry with id "${opts.id}" found.`;
 }
 
@@ -857,7 +868,7 @@ const GREP_FIELDS = {
   after: Type.Optional(Type.Integer({ minimum: 0, description: "Context lines after (default 6)" })),
   maxMatches: Type.Optional(Type.Integer({ minimum: 1, description: "Max matches per page (default 15); character limit also applies" })),
   offset: Type.Optional(Type.Integer({ minimum: 0, description: "Match offset (0-based, default 0). Use the next offset reported by the previous page." })),
-  charOffset: Type.Optional(Type.Integer({ minimum: 0, description: "Character offset within that match's context (default 0). Use with offset to continue a partially shown match." })),
+  charOffset: Type.Optional(Type.Integer({ minimum: 0, description: "Character offset within that match's context (default 0). Keep pattern, file, before/after and throughEntry unchanged when continuing; otherwise restart the match with charOffset=0." })),
   throughEntry: THROUGH_ENTRY_FIELD,
 };
 const SHOW_FIELDS = {
@@ -878,7 +889,7 @@ function lookupPartialFindings(text: string, marker: string): string {
 }
 
 const LOOKUP_WRITEUP_PROMPT =
-  "You are out of search turns. Report what you found so far: the facts you confirmed (with ENTRY ids), " +
+  "Search is finished; no further tool calls are allowed. Report what you found so far: the facts you confirmed (with ENTRY ids), " +
   "what you couldn't find, and where you'd look next.";
 
 const LOOKUP_SYSTEM_PROMPT = `You are a context-lookup subagent for a coding agent whose main context was compacted by verbatim compaction. The full pre-compaction transcript — including assistant thinking blocks and complete tool outputs that were REMOVED from the main context — is in the transcript files named in the request.
@@ -888,7 +899,7 @@ You have three tools:
 - grep: paginated transcript search; matches come with surrounding lines and authoritative ENTRY attribution
 - show_entry: retrieve an entry by id in bounded pages
 
-Search tools bound each response, not the underlying history. If a page is limited, follow its continuation parameters to retrieve later matches or the rest of an entry, including oversized single lines. A partial page is not the entire evidence.
+Search tools bound each response, not the underlying history. A partial page is not the entire evidence, but you do NOT need to exhaust every page. Follow continuation parameters only when omitted content is needed to answer the question, keeping all other search/context parameters unchanged. Narrow an overly broad search rather than paging through irrelevant matches. Stop paging once you have sufficient relevant evidence.
 
 Work efficiently: start with list_entries if you don't know where to look, then grep for concrete terms, then show_entry for exact content. When you are confident you have what is needed, stop calling tools and output your final answer as plain text.
 
@@ -904,6 +915,37 @@ Provenance rules — label each finding with its source type:
 - "reasoning at the time (thinking)" — what the agent believed or hypothesized then; NOT verified fact
 Grep attributions include a section tag like [thinking] / [text] / [toolCall]. When a finding rests on old thinking, say explicitly that it was reasoning-at-the-time, so the main agent does not treat it as established fact.`;
 
+// Canonical effective parameters identify a specific issued page, not merely
+// a positive offset. Defaults may be made explicit without changing a query.
+function lookupPageKey(name: string, args: Record<string, any>): string | undefined {
+  const number = (key: string, fallback: number, min = 0): number | undefined => {
+    const value = args[key] ?? fallback;
+    return Number.isSafeInteger(value) && value >= min ? value : undefined;
+  };
+  const string = (key: string): string | null | undefined => {
+    const value = args[key];
+    return value == null ? null : typeof value === "string" ? value : undefined;
+  };
+  let fields: unknown[];
+  switch (name) {
+    case "list_entries":
+      fields = [string("file"), number("offset", 0), string("throughEntry")];
+      break;
+    case "grep":
+      fields = [typeof args.pattern === "string" ? args.pattern : undefined, string("file"),
+        number("before", 2), number("after", 6), number("maxMatches", 15, 1),
+        number("offset", 0), number("charOffset", 0), string("throughEntry")];
+      break;
+    case "show_entry":
+      fields = [typeof args.id === "string" ? args.id : undefined, string("file"),
+        number("maxLines", 400, 1), number("offset", 0)];
+      break;
+    default:
+      return undefined;
+  }
+  return fields.includes(undefined) ? undefined : JSON.stringify([name, ...fields]);
+}
+
 async function runLookupSubagent(opts: {
   question: string;
   transcripts: Transcript[];
@@ -916,17 +958,17 @@ async function runLookupSubagent(opts: {
   const tools: AiTool[] = [
     {
       name: "list_entries",
-      description: "List ENTRY headers and previews in pages of up to 12000 payload characters, plus cursor notes. Follow all reported continuation parameters (offset and throughEntry). Optional file restricts to a logical transcript name.",
+      description: "List ENTRY headers and previews in pages of up to 12000 payload characters, plus cursor notes. If additional previews are needed, follow all reported continuation parameters (offset and throughEntry). Optional file restricts to a logical transcript name.",
       parameters: Type.Object({ ...LIST_FIELDS, file: FILE_FIELD }),
     },
     {
       name: "grep",
-      description: "Regex-search transcript lines with surrounding context and authoritative entry attribution. Up to 12000 payload characters per page, plus cursor notes. Follow all reported continuation parameters (offset, charOffset, throughEntry) for remaining matches or oversized lines. pattern is a JS regex (case-insensitive).",
+      description: "Regex-search transcript lines with surrounding context and authoritative entry attribution. Up to 12000 payload characters per page, plus cursor notes. Follow all reported continuation parameters (offset, charOffset, throughEntry) only if omitted matches/context are needed. pattern is a JS regex (case-insensitive).",
       parameters: Type.Object({ ...GREP_FIELDS, file: FILE_FIELD }),
     },
     {
       name: "show_entry",
-      description: "Retrieve an indexed entry by ENTRY id in pages of up to 24000 payload characters and maxLines lines, plus attribution/cursor notes. Follow the reported offset for the rest; a page may not contain the entire entry.",
+      description: "Retrieve an indexed entry by ENTRY id in pages of up to 24000 payload characters and maxLines lines, plus attribution/cursor notes. Follow the reported offset only if omitted content is needed; a page may not contain the entire entry.",
       parameters: Type.Object({ ...SHOW_FIELDS, file: FILE_FIELD }),
     },
   ];
@@ -938,20 +980,27 @@ async function runLookupSubagent(opts: {
         `Question: ${opts.question}\n\n` +
         `Transcript files (full raw session branch; ENTRY blocks are anchored by entry id):\n` +
         opts.transcripts.map((d) => `- ${d.file}`).join("\n") +
-        `\n\nTranscript overview (first entries; call list_entries for the full list):\n${toc}`,
+        `\n\nTranscript overview (first entries; list_entries can retrieve additional previews if needed):\n${toc}`,
       timestamp: Date.now(),
     },
   ];
 
+  // Ephemeral admission state only: no telemetry, saved trace, or cursor
+  // parsing from untrusted transcript text. Each issued cursor is single-use.
+  const continuations = new Set<string>();
   const dispatch = (name: string, args: Record<string, any>): string => {
+    const issued: OnContinuation = (cursor) => {
+      const key = lookupPageKey(name, { ...args, ...cursor });
+      if (key) continuations.add(key);
+    };
     try {
       switch (name) {
         case "list_entries":
-          return listEntries(opts.transcripts, args);
+          return listEntries(opts.transcripts, args, issued);
         case "grep":
-          return grepTranscript(opts.transcripts, args);
+          return grepTranscript(opts.transcripts, args, issued);
         case "show_entry":
-          return showEntry(opts.transcripts, args);
+          return showEntry(opts.transcripts, args, issued);
         default:
           return `Unknown tool: ${name}`;
       }
@@ -961,8 +1010,22 @@ async function runLookupSubagent(opts: {
   };
 
   const sessionId = uuidv7();
+  // Continuations do not spend the substantive-search budget, but still cost
+  // inference. Bound ALL search-phase model calls, plus one final write-up.
+  const maxModelCalls = Math.min(Number.MAX_SAFE_INTEGER, cfg.lookupTurns * 3);
+  const searchLimit = `${cfg.lookupTurns}-turn limit`;
+  let limit = `${maxModelCalls}-call total limit`;
+  let searchTurns = 0;
+  let pagingOnlyNotified = false;
   let lastText = "";
-  for (let turn = 0; turn < cfg.lookupTurns; turn++) {
+  for (let turn = 0; turn < maxModelCalls; turn++) {
+    if (searchTurns >= cfg.lookupTurns) {
+      if (continuations.size === 0) { limit = searchLimit; break; }
+      if (!pagingOnlyNotified) {
+        messages.push({ role: "user", content: "The substantive search-turn budget is exhausted. Only follow previously issued continuation pages if needed, or answer now. Do not start new searches.", timestamp: Date.now() });
+        pagingOnlyNotified = true;
+      }
+    }
     const resp = await opts.registry.complete(
       opts.model,
       normalizeContext({ systemPrompt: LOOKUP_SYSTEM_PROMPT, messages, tools }),
@@ -979,6 +1042,18 @@ async function runLookupSubagent(opts: {
       return truncateHead(text || "(subagent returned no answer)", cfg.lookupAnswerMaxChars);
     }
 
+    // Check the whole batch against cursors issued BEFORE this response.
+    // New queries, changed parameters, invented/replayed cursors and duplicate
+    // continuations consume a search turn, even alongside a valid continuation.
+    const available = new Set(continuations);
+    const keys = toolCalls.map((call) => lookupPageKey(String(call.name), (call.arguments ?? {}) as Record<string, any>));
+    const continuationOnly = keys.every((key) => key !== undefined && available.delete(key));
+    if (!continuationOnly) {
+      if (searchTurns >= cfg.lookupTurns) { limit = searchLimit; break; }
+      searchTurns++;
+    }
+    // Consume before dispatch, so a sibling cannot consume a newly issued page.
+    for (const key of keys) if (key) continuations.delete(key);
     messages.push(resp);
     for (const call of toolCalls) {
       const args = (call.arguments ?? {}) as Record<string, any>;
@@ -994,10 +1069,10 @@ async function runLookupSubagent(opts: {
     }
   }
 
-  // Out of search turns: one extra call with no tools, asking for a write-up of
-  // what was found, so a timed-out lookup still returns usable findings.
+  // Either budget is exhausted: one extra tool-free write-up still returns
+  // usable partial findings without extending searching or paging indefinitely.
   messages.push({ role: "user", content: LOOKUP_WRITEUP_PROMPT, timestamp: Date.now() });
-  const marker = `[subagent reached the ${cfg.lookupTurns}-turn limit; this is its write-up of partial findings]`;
+  const marker = `[subagent reached the ${limit}; this is its write-up of partial findings]`;
   let writeupError = "";
   try {
     const resp = await opts.registry.complete(
@@ -1011,7 +1086,7 @@ async function runLookupSubagent(opts: {
     writeupError = errMsg(err);
   }
   const why = writeupError ? `; write-up failed: ${writeupError}` : "";
-  return lookupPartialFindings(lastText, `[subagent reached the ${cfg.lookupTurns}-turn limit; findings may be incomplete${why}]`);
+  return lookupPartialFindings(lastText, `[subagent reached the ${limit}; findings may be incomplete${why}]`);
 }
 
 // ============================================================================

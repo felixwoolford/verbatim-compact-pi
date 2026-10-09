@@ -175,11 +175,27 @@ another registered model. An unresolved configured model falls back to the
 session model. No separate process, loaded model, or external subagent extension
 is required.
 
-The default budget is ten search turns, with up to 4,096 output tokens per model
-call. Exhaustion adds one tool-free call asking for partial findings. If that call
-fails or returns no text, the latest assistant text is returned with an
-incomplete-findings marker. Search responses and final answers have character
-guards. Cancellation is passed through to model calls. Each lookup has a separate,
+The default budget is ten substantive search turns, with up to 4,096 output
+tokens per model call. A response containing only valid continuations of pages
+previously issued by the search functions does not spend that budget. Effective
+query/context parameters, page limits, logical file, and reported source boundary
+must match; making implicit defaults explicit is permitted. Each issued cursor
+is single-use. Mixed batches, changed queries, invented/replayed cursors, and
+duplicate continuations spend one substantive turn. Admission uses ephemeral
+cursor keys from the pagination functions, not cursor-looking historical text;
+no telemetry or subagent trace is persisted. Valid continuations can still be
+followed after the substantive budget is spent, but no new searches are executed.
+
+All search-phase model requests also have a separate ceiling of three times the
+configured search budget (30 by default; bounded to a safe integer). This is a
+runaway-paging guard, not a newly measured optimum. Exhaustion of either budget
+adds one tool-free call asking for partial findings, with a marker identifying
+the limit reached. If that call fails or returns no text, the latest assistant
+text is returned with an incomplete-findings marker. Instructions tell the
+subagent to follow pages only when omitted content is needed, narrow overly
+broad searches, and stop once it has sufficient relevant evidence. Search
+responses and final answers have character guards. Cancellation is passed
+through to model calls. Each lookup has a separate,
 stable session id across its search and write-up calls. The extension does not
 force `cacheRetention: "none"`; normal provider caching defaults apply, without
 guaranteeing cache hits or discounts on every provider.
@@ -238,7 +254,10 @@ subagent and main-agent fallback tools.
   match index. If a match's surrounding context exceeds the remaining character
   budget, the response reports both `offset` and `charOffset` for continuing that
   match, repeating its authoritative entry/section attribution. Notices report
-  how many matches remain, including a partially shown match.
+  how many matches remain, including a partially shown match. Out-of-range
+  `charOffset` errors explain its dependence on unchanged search/context
+  parameters and give a one-step repair: retry the same match `offset` with
+  `charOffset=0`. They do not assert which parameter changed.
 
 Character offsets use JavaScript UTF-16 code units, not bytes or tokens. Limited
 pages print exact continuation parameters; keep other parameters unchanged.

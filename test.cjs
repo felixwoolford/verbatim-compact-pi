@@ -440,6 +440,7 @@ async function main() {
     assert.deepEqual(Object.keys(ext.tools), ["context_list_entries", "context_grep", "context_show_entry", "context_lookup"]);
     await hybridTests(hybridHelpers);
     await require("./scripts/pagination-tests.cjs")(hybridHelpers);
+    await require("./scripts/lookup-paging-tests.cjs")(hybridHelpers);
     await require("./scripts/runtime-lookup-tests.cjs")({ ...hybridHelpers, jiti, piRoot });
     assert.deepEqual(Object.keys(ext.commands), ["compaction-method", "cap-compaction"]);
     await methodTests(factory, SessionManager, root);
@@ -612,7 +613,7 @@ async function main() {
         if (count <= 2) return response([text("Partial old evidence"), toolCall("grep", { pattern: "EARLIEST_TOOL_OUTPUT_START" }, `turn${count}`)], "toolUse");
         const declaredTools = context.messages.filter((m) => m.role === "system").flatMap((m) => m.toolsAdded ?? []);
         assert.equal(declaredTools.length, 0, "write-up call has no tools");
-        assert(JSON.stringify(context.messages.at(-1)).includes("out of search turns"));
+        assert(JSON.stringify(context.messages.at(-1)).includes("Search is finished"));
         if (writeupMode === "throw") throw new Error("write-up unavailable");
         if (writeupMode === "empty") return response([]);
         if (writeupMode === "aborted" || writeupMode === "error") return response([], writeupMode);

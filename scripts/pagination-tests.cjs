@@ -104,7 +104,10 @@ module.exports = async function paginationTests(h) {
   assert.equal(pages, 8);
   assert.deepEqual(found, Array.from({ length: 37 }, (_, i) => `BATCH_MATCH_${i}`));
   assert((await call("context_grep", { pattern, offset: 37, throughEntry })).startsWith("No more matches"));
-  assert((await call("context_grep", { pattern, charOffset: 999999 })).startsWith("Invalid charOffset"));
+  const invalidCursor = await call("context_grep", { pattern, charOffset: 999999 });
+  assert(invalidCursor.startsWith("Invalid charOffset"));
+  assert(invalidCursor.includes("same pattern, file, before/after, and throughEntry"));
+  assert(invalidCursor.includes("Restart this match at offset=0 with charOffset=0"));
 
   const giantLine = "ONE_GIANT_MATCH_" + "z".repeat(40000) + "_END";
   const giantId = manager.appendMessage(user(giantLine));
@@ -124,6 +127,19 @@ module.exports = async function paginationTests(h) {
     charOffset = Number(next[2]);
   }
   assert.equal(joined, ">> " + giantLine, "long matching lines remain fully accessible");
+  // A charOffset into a large context is invalid after shrinking before/after.
+  manager.appendMessage(user("q".repeat(20000) + "\nSMALL_CONTEXT_MATCH"));
+  const contextArgs = { pattern: "^SMALL_CONTEXT_MATCH$", before: 1, after: 0 };
+  const contextPage = await call("context_grep", contextArgs);
+  const contextCursor = /offset=(\d+), charOffset=(\d+), throughEntry="([^"]+)"\.\]$/.exec(contextPage);
+  assert(contextCursor);
+  const staleArgs = { ...contextArgs, before: 0, offset: Number(contextCursor[1]), charOffset: Number(contextCursor[2]), throughEntry: contextCursor[3] };
+  const stale = await call("context_grep", staleArgs);
+  assert(stale.includes("before/after") && stale.includes("offset=0 with charOffset=0"));
+  const repaired = await call("context_grep", { ...staleArgs, charOffset: 0 });
+  assert(repaired.includes(">> SMALL_CONTEXT_MATCH"), "the suggested repair works in one step");
+  await search(ext, ctx, [toolCall("grep", staleArgs)], ([result]) => assert.equal(result, stale, "subagent cursor errors offer the same repair"));
+
   const grepArgs = { pattern, before: 0, after: 0, maxMatches: 3, offset: 15 };
   const directGrep = await call("context_grep", grepArgs);
   await search(ext, ctx, [toolCall("grep", grepArgs)], ([result]) => assert.equal(result, directGrep));

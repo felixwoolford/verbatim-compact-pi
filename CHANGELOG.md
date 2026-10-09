@@ -21,6 +21,17 @@
 - Subagent lookup provides list, grep, and entry-retrieval tools; exhausted lookups
   receive one final tool-free write-up of partial findings. The extension appends
   fallback guidance even when the write-up fails or its findings are truncated.
+- Subagent continuation-only turns no longer spend the substantive search-turn
+  budget when they use previously issued, single-use cursors with unchanged
+  effective parameters. New searches, mixed batches, invented/replayed cursors,
+  and duplicate continuations still count. A separate ceiling allows at most
+  3× the configured budget in search-phase model calls (30 by default), plus
+  one final tool-free write-up. This is a safety guard, not a measured optimum;
+  no telemetry or subagent trace is persisted.
+- Paging guidance now asks for continuation only when omitted evidence matters,
+  rather than exhausting every page. Invalid grep `charOffset` errors explain
+  the unchanged-parameter requirement and how to restart the match at
+  `charOffset=0`.
 - Hybrid recovery is now the default: `context_list_entries`, `context_grep`, and
   `context_show_entry` provide bounded direct search when subagent findings are
   incomplete. The checkpoint, tool descriptions, and bundled skill consistently
@@ -66,8 +77,9 @@
   cap dialogs/modes/budgets, percentage defaults/model changes, cancellation,
   the skill, and Pi's real package loader. Hybrid regressions additionally cover
   narration, same-message/parallel attempts, pagination and oversized lines,
-  truncation boundaries, provider caching options, and real Pi agent-turn
-  persistence ordering with a stubbed model (no live inference).
+  continuation budget accounting/replay protection, total-call ceilings,
+  cursor-error recovery, truncation boundaries, provider caching options, and
+  real Pi agent-turn persistence ordering with a stubbed model (no live inference).
 - Preliminary synthetic pilot figures are preserved as historical results from
   the dump-based implementation, not measurements of the current implementation.
 

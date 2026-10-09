@@ -41,9 +41,10 @@ the same recovery episode. Narration and thinking do not reset it either. Only
 a tool result outside the four recovery tools, a user message, or a bash
 execution resets the limit.
 
-Search responses are pages, not necessarily complete evidence. Follow the
-continuation parameters printed at the end of a limited page, keeping other
-parameters unchanged:
+Search responses are pages, not necessarily complete evidence. Follow pages
+only when omitted content is needed; do not exhaust every match or entry merely
+because a continuation is available. Keep other parameters unchanged and use
+all continuation parameters printed at the end of a limited page:
 
 - Listings and entry retrieval: `offset` counts characters (UTF-16 code units)
   in the rendered listing or entry, starting at 0.
@@ -55,8 +56,10 @@ parameters unchanged:
 Listing/grep cursors also report `throughEntry`: retain this original last-entry
 id on subsequent pages, so newly appended calls/results cannot keep expanding
 the search. The source is rendered afresh, without a snapshot. If you change
-search/context parameters or navigate to another branch, restart at offset 0
-without `throughEntry`.
+search/context parameters or navigate to another branch, restart at `offset=0`
+(and `charOffset=0` for grep) without `throughEntry`. If grep reports an invalid
+`charOffset`, retry that match at the same `offset` with `charOffset=0` and your
+intended context parameters.
 
 ## Rules
 
