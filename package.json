@@ -1,6 +1,6 @@
 {
   "name": "verbatim-compact",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Deterministic, verbatim-preserving compaction for Pi, with session-backed subagent context recovery.",
   "license": "MIT",
@@ -15,12 +15,10 @@
     "node": ">=22.19.0"
   },
   "files": [
-    "source/extensions/verbatim-compact.ts",
+    "source/extensions/",
     "source/skills/context-retrieval/",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
     "docs/"
   ],
   "pi": {
