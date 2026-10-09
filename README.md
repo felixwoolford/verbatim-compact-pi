@@ -9,7 +9,7 @@ Verbatim compaction itself makes no model call. When a
 missing detail is needed, `context_lookup` runs a subagent over the session's
 full raw branch and returns only relevant findings.
 
-The goal is to let the agent withstand ~8 compactions without the copy-of-a-copy degradation of model-summary compaction, which is exacerbated in sub-frontier models.
+The goal is to let the agent withstand many (but finite) rounds of compaction without the copy-of-a-copy degradation of model-summary compaction, which is exacerbated in sub-frontier models.
 
 The defining property of verbatim-compact is the guarantee that all history is either kept
 verbatim in context or stripped entirely from it; nothing is ever compressed in
@@ -121,6 +121,11 @@ tail—not to the opaque summary base.
 
 ### Control the compaction cap
 
+Capping of the context eventually applies to strip further elements from the checkpoint.
+See [how cap trimming works](#how-cap-trimming-works) for the removal order.
+This is meant as a fallback option for allowing compaction rounds to run far in excess of the intended use case, and should probably be used to allow work to be wrapped up before handing off to a new session. 
+If you find that in normal usage you frequently work over the compaction cap, other compaction tools are likely to be more suitable.
+
 The default is **`warn 25%`**: a conversation-section budget estimated at 25% of
 the current model's context window, using **4 characters per token**, not an
 exact tokenizer. When content would actually be trimmed, choose **Apply trimming**,
@@ -149,7 +154,7 @@ Tokens are estimated with `ceil(chars / 4)`, not an exact tokenizer. For a
 characters. Percentages follow the current model's context window after model
 changes; fractional token budgets round down, with a minimum of one token.
 `80000c` preserves the existing budget scope and trimming algorithm exactly.
-See [how cap trimming works](#how-cap-trimming-works) for the removal order.
+
 
 The budget is a size guard, not a guarantee that the whole model context fits.
 Instructions and file lists remain outside it; inherited opaque bases remain
@@ -164,49 +169,6 @@ for unattended operation. If a percentage cannot be resolved because the model's
 context window is unavailable, compaction is cancelled: choose a character/token
 budget or turn the cap off.
 
-### Recover historical details
-
-The extension registers a subagent lookup and three direct-search fallback tools:
-
-| Tool | Purpose |
-|---|---|
-| `context_lookup` | Recover specific historical details from the full raw session branch. Accepts only `question`. |
-| `context_list_entries` | Fallback: list entry ids, roles, timestamps, and previews. |
-| `context_grep` | Fallback: regex-search the raw branch with surrounding lines and entry attribution. |
-| `context_show_entry` | Fallback: retrieve an entry by id. |
-
-For example, ask the agent to recover the build error observed before compaction.
-It can call `context_lookup` with:
-
-```json
-{
-  "question": "What exact build error did we observe for src/auth.ts before compaction? Include the ENTRY id and observed tool output."
-}
-```
-
-The subagent searches in its own context and returns findings with entry
-references. Its raw search results stay out of the main conversation. If findings
-are incomplete, the fallback tools run the same searches directly; their results
-enter the main context. Turn-limit write-ups include a note recommending these
-tools for further detail on the same query, even if the write-up fails.
-
-By default, only one `context_lookup` attempt is allowed until a user message,
-a bash execution, or a tool result outside these four recovery tools resets the
-limit. Fallback searches, assistant text, and thinking neither increase nor reset
-the count. Pending lookup calls in the same batch also count, preventing parallel
-calls from bypassing the limit. Blocked attempts return a short fallback note
-without launching a subagent; later lookups after other work remain available.
-
-Search responses are bounded pages, not necessarily complete entries or match
-lists. Follow all reported continuation parameters, keeping other search
-parameters unchanged. Listing and grep cursors include `throughEntry` to keep
-newly appended calls/results from expanding the search while paging. The raw
-history remains complete; oversized entries and individual lines remain
-accessible across pages.
-
-After compaction, the checkpoint instructs the agent to re-read required documents,
-even if previously read, re-acquire missing task information, inspect Git state
-when in a Git repository, and re-read files before modifying them.
 
 ## Configuration
 
@@ -353,21 +315,50 @@ labeled incomplete. Lookup requests use normal provider caching
 defaults rather than forcing caching off; actual cache behavior and savings vary
 by provider.
 
-## Local-inference trade-offs
+### Recover historical details
 
-- Compaction uses CPU text processing instead of model inference, with no extra
-  transcript write beyond Pi's normal session persistence.
-- User messages and assistant prose are carried forward without model rewriting.
-  Exact removed evidence remains available outside active context.
-- Recovery inference is deferred until a lookup is requested and normally uses
-  the same session model.
-- A checkpoint still consumes context. A larger character budget retains more
-  prose but increases subsequent prompt processing and context use.
-- Lookups require inference and may take substantial time. Lower compaction
-  latency does not imply lower total runtime for every workload.
+The extension registers a subagent lookup and three direct-search fallback tools:
 
-With a local lookup model, transcript excerpts remain within the local workflow.
-Selecting a remote lookup model sends those excerpts to its provider.
+| Tool | Purpose |
+|---|---|
+| `context_lookup` | Recover specific historical details from the full raw session branch. Accepts only `question`. |
+| `context_list_entries` | Fallback: list entry ids, roles, timestamps, and previews. |
+| `context_grep` | Fallback: regex-search the raw branch with surrounding lines and entry attribution. |
+| `context_show_entry` | Fallback: retrieve an entry by id. |
+
+For example, ask the agent to recover the build error observed before compaction.
+It can call `context_lookup` with:
+
+```json
+{
+  "question": "What exact build error did we observe for src/auth.ts before compaction? Include the ENTRY id and observed tool output."
+}
+```
+
+The subagent searches in its own context and returns findings with entry
+references. Its raw search results stay out of the main conversation. If findings
+are incomplete, the fallback tools run the same searches directly; their results
+enter the main context. Turn-limit write-ups include a note recommending these
+tools for further detail on the same query, even if the write-up fails.
+
+By default, only one `context_lookup` attempt is allowed until a user message,
+a bash execution, or a tool result outside these four recovery tools resets the
+limit. Fallback searches, assistant text, and thinking neither increase nor reset
+the count. Pending lookup calls in the same batch also count, preventing parallel
+calls from bypassing the limit. Blocked attempts return a short fallback note
+without launching a subagent; later lookups after other work remain available.
+
+Search responses are bounded pages, not necessarily complete entries or match
+lists. Follow all reported continuation parameters, keeping other search
+parameters unchanged. Listing and grep cursors include `throughEntry` to keep
+newly appended calls/results from expanding the search while paging. The raw
+history remains complete; oversized entries and individual lines remain
+accessible across pages.
+
+After compaction, the checkpoint instructs the agent to re-read required documents,
+even if previously read, re-acquire missing task information, inspect Git state
+when in a Git repository, and re-read files before modifying them.
+
 
 ## Pilot results
 
