@@ -85,6 +85,8 @@ async function compact(ext, ctx, ids, kept, reason = "manual", fileOps) {
   assert(c.summary.includes("Retained prose is a record of what was said, not verification of its claims."));
   assert(c.summary.includes("If this is a Git repository, run `git status`"));
   assert(c.summary.includes("Thinking and tool outputs were removed."));
+  assert(c.summary.includes("**Evidence boundary:** Tool signatures and file lists do not contain command output, file contents, or rules from read documents;"));
+  assert(c.summary.lastIndexOf("**Evidence boundary:**") < c.summary.lastIndexOf("Conversation"), "closing evidence rule stays above the uncompacted tail");
   assert(!c.summary.includes("EARLIEST_TOOL_OUTPUT"));
   assert(!c.summary.includes("EARLIEST_THINKING"));
   const id = ctx.sessionManager.appendCompaction(c.summary, kept, c.tokensBefore, c.details, true);
@@ -444,6 +446,7 @@ async function main() {
     await require("./scripts/runtime-lookup-tests.cjs")({ ...hybridHelpers, jiti, piRoot });
     assert.deepEqual(Object.keys(ext.commands), ["compaction-method", "cap-compaction"]);
     await methodTests(factory, SessionManager, root);
+    await require("./scripts/checkpoint-evidence-tests.cjs")({ ...hybridHelpers, compact });
     await capPolicyTests(capHelpers);
     assert.deepEqual(Object.keys(ext.tools.context_lookup.parameters.properties), ["question"]);
     assert(!ext.tools.context_lookup.description.includes(".pi/context-dumps"));
@@ -476,7 +479,8 @@ async function main() {
     const c1 = await compact(ext, ctx, [f.u, f.a, f.t], f.kept, "manual", { read: new Set(["src/bar.ts"]), written: new Set(), edited: new Set(["src/foo.ts"]) });
     assert(c1.summary.includes("Please fix the N=7 bug."));
     assert(c1.summary.includes("I will inspect the file."));
-    assert(c1.summary.includes("[Assistant tool calls] (outputs removed): read("));
+    assert(c1.summary.includes("[Assistant tool calls]: read("));
+    assert(c1.summary.includes("[ok; output removed]"));
     assert(!c1.summary.includes(argumentsText), "checkpoint truncates long arguments");
     const next = f.manager.appendMessage(user("The next retained tail.", epoch + 2000));
     const c2 = await compact(ext, ctx, [f.kept], next, "threshold");

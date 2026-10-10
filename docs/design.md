@@ -18,6 +18,20 @@ verbatim mode, the extension:
 2. Removes thinking and tool results from the messages Pi selected for compaction.
 3. Builds and returns a deterministic checkpoint, with compact tool signatures.
 
+Each new tool signature carries `[ok; output removed]`, `[error; output removed]`,
+or `[unknown; output removed]`. Calls are paired with subsequent results by ID
+and tool name within the combined preparation message arrays, not by scanning
+raw branches or retained messages. Only an explicit boolean `isError` provides a
+known status. Concurrent duplicate IDs, missing results/statuses, and mismatched
+names are not guessed; sequential reuse after a consumed result is supported.
+Result bodies are not inspected, and `ok` is not evidence that a command or tests
+passed. Previously stored spans keep their old format; the checkpoint explicitly
+says unlabelled older outcomes are unknown. Example rendering:
+
+```text
+[Assistant tool calls]: read(path="SPEC.md") [ok; output removed]; bash(command="npm test") [error; output removed]
+```
+
 No model call, transcript write, or dump pruning occurs in the hook. Pi retains
 the raw branch and persists the returned compaction entry through its normal
 session machinery. If checkpoint construction fails, the hook returns no
@@ -60,8 +74,12 @@ does not automatically carry these lists from extension-provided compactions.
 
 The closing line ("Conversation from … onward continues verbatim below") is the
 last line of the checkpoint. File lists describe compacted spans and sit above
-it; everything after that line is Pi's retained verbatim tail. Generated recovery
-instructions contain no filesystem path to the transcript.
+it. Each read-file path is labelled `(content removed)` in the rendered list;
+the metadata retains bare paths. A one-line evidence boundary rule follows the
+file lists, requiring recovery or re-reading before relying on removed command
+output, file contents, or document rules. Everything after the closing line is
+Pi's retained verbatim tail. Generated recovery instructions contain no filesystem
+path to the transcript.
 
 ## Size guard
 
@@ -105,6 +123,15 @@ When span content exceeds the available budget, the extension:
 1. Removes the oldest non-user lines.
 2. Shortens oversized user lines, each at most once.
 3. Removes the oldest remaining lines until the line budget is satisfied.
+
+Each stage stops as soon as the budget is satisfied. Here, a "line" is a whole
+rendered entry, which may contain multiple physical lines or paragraphs. User
+stubs preserve the first 120 characters of the rendered `[User]: ...` entry,
+including its prefix, and append `…[truncated +N chars — use context_lookup]`.
+An entry is shortened only if that stub is smaller than the original, at most
+once per cap pass; this is literal prefix retention, not model summarization.
+If a span is emptied, it receives a trimmed-for-size placeholder. The original
+uncapped span details and raw session entries remain unchanged.
 
 The implementation accounts for section/tag overhead before capping lines, but
 retains a minimum line budget of 500 characters. The inherited base summary is

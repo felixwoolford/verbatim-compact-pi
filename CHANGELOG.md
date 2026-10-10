@@ -4,6 +4,11 @@
 
 - Deterministic checkpoints retain user messages and assistant prose, subject to
   a size guard; thinking, full tool outputs, and arguments remain in Pi's session.
+- Tool signatures record per-call `ok`, `error`, or `unknown` outcomes from
+  matched tool-result metadata, always marking output as removed. Missing or
+  ambiguous outcomes are never inferred, including unlabelled older spans.
+- Read-file entries explicitly mark content as removed; a closing evidence rule
+  requires lookup or re-reading before relying on removed outputs or document rules.
 - Flat chronological spans avoid repeatedly summarizing earlier facts.
 - Session-persistent `/compaction-method verbatim|summary` selects manual,
   automatic, and overflow-recovery compaction independently of auto-compaction

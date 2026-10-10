@@ -236,47 +236,29 @@ extension builds a checkpoint without changing that boundary or calling a model:
 |---|---|
 | User messages | Kept verbatim, subject to the size guard. |
 | Assistant prose | Kept, subject to the size guard. |
-| Tool calls | Compact signatures with truncated arguments. Full arguments remain in the session. |
+| Tool calls | Short signatures with outcome labels; full arguments and outputs remain recoverable. |
 | Assistant thinking | Removed from the checkpoint; retained in the raw session. |
 | Tool outputs | Removed from the checkpoint; retained in the raw session. |
 | Recent conversation | Pi keeps its normal verbatim tail. |
 | Earlier compacted spans | Re-rendered chronologically, without repeated model summarization. |
 | Inherited model/legacy summary | Kept once as an opaque base, when present. |
-| Read/modified file lists | Carried forward, without file contents. |
+| Read/modified file lists | Carried forward, with file contents marked as removed. |
 
-A single re-orientation block tells the agent what was removed and what must be
-verified before being relied on. A closing line identifies where Pi's retained
-verbatim tail begins.
+Checkpoints label tool outcomes as `ok`, `error`, or `unknown` and remind the
+agent to recover missing evidence and re-read required documents before relying
+on them. These labels describe tool results, not a guarantee that tests passed.
 
 #### How cap trimming works
 
-The default conversation-section budget is **25% of the model's context window**,
-using estimated tokens, with a prompt before trimming. When trimming is approved
-(or cap mode is `on`), **user messages are prioritized over other content**—it is
-not simply a global oldest-first cutoff.
+**User messages are prioritized**—capping is not simply an oldest-first cutoff:
 
-Across all compacted spans, the algorithm proceeds in three stages, stopping as
-soon as the available line budget is satisfied:
+1. Remove non-user content, oldest first.
+2. If still over budget, shorten long user messages to marked prefix stubs,
+   oldest first.
+3. As a last resort, remove the oldest remaining content, including user messages.
 
-1. **Remove non-user entries, oldest first.** Assistant prose, tool-call stubs,
-   and other non-user entries are dropped before any user message is shortened.
-   A newer assistant entry can therefore be removed while an older user message
-   survives. These are whole rendered entries, not individual physical lines;
-   an assistant prose entry can contain multiple paragraphs.
-2. **Shorten long user messages, oldest first.** Each eligible message becomes
-   the first 120 characters of its rendered `[User]: ...` entry (including the
-   prefix), followed by a marker such as
-   `…[truncated +1234 chars — use context_lookup]`. This happens only when the
-   stub is shorter than the original, and each entry is shortened at most once
-   per cap pass. It is a literal prefix, not a model-generated summary.
-3. **Remove the oldest remaining entries if still over budget.** This last
-   resort can remove user messages too, including shortened stubs. A fully
-   dropped span is represented by a trimmed-for-size placeholder.
-
-Only the rendered checkpoint is trimmed: full originals remain in the session
-and the uncapped span details, recoverable through `context_lookup`. The setting
-is a size guard, not a hard cap on the whole checkpoint; the budget scope and
-exceptions described above still apply.
+Trimming stops once the budget is satisfied. Originals remain recoverable from
+the session. See [design notes](docs/design.md) for implementation details.
 
 
 ### Session-backed lookup

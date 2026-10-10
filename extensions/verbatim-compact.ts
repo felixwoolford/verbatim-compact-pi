@@ -439,6 +439,26 @@ function toolCallSignature(name: string, args: Record<string, unknown> | undefin
 }
 
 function summarizeMessages(messages: AgentMessage[]): string[] {
+  // Pair calls with later results in Pi's selected messages only. Never infer
+  // outcomes from result text, assistant claims, or another branch/the kept tail.
+  const outcomes = new Map<object, "ok" | "error">();
+  const pending = new Map<string, { block: object; name: string } | null>();
+  for (const msg of messages) {
+    const m = msg as unknown as Record<string, any>;
+    if (m.role === "assistant") {
+      for (const block of m.content ?? []) {
+        if (block.type !== "toolCall" || typeof block.id !== "string" || !block.id) continue;
+        // Concurrent duplicate IDs cannot be attributed safely. Sequential
+        // reuse is fine once the preceding call's result has been consumed.
+        pending.set(block.id, pending.has(block.id) ? null : { block, name: block.name });
+      }
+    } else if (m.role === "toolResult") {
+      const call = pending.get(m.toolCallId);
+      if (!call || call.name !== m.toolName) continue;
+      if (typeof m.isError === "boolean") outcomes.set(call.block, m.isError ? "error" : "ok");
+      pending.delete(m.toolCallId);
+    }
+  }
   const lines: string[] = [];
   for (const msg of messages) {
     const m = msg as unknown as Record<string, any>;
@@ -453,11 +473,12 @@ function summarizeMessages(messages: AgentMessage[]): string[] {
         const calls: string[] = [];
         for (const block of m.content ?? []) {
           if (block.type === "text") prose += (prose ? "\n" : "") + String(block.text ?? "");
-          else if (block.type === "toolCall") calls.push(toolCallSignature(String(block.name), block.arguments));
+          else if (block.type === "toolCall")
+            calls.push(`${toolCallSignature(String(block.name), block.arguments)} [${outcomes.get(block) ?? "unknown"}; output removed]`);
           // thinking blocks: removed by design (kept in the session)
         }
         if (prose.trim()) lines.push(`[Assistant]: ${prose.trim()}`);
-        if (calls.length > 0) lines.push(`[Assistant tool calls] (outputs removed): ${calls.join("; ")}`);
+        if (calls.length > 0) lines.push(`[Assistant tool calls]: ${calls.join("; ")}`);
         break;
       }
       case "toolResult":
@@ -591,6 +612,8 @@ const REORIENT_BLOCK = `**Re-orient before continuing.** Compaction may have rem
 
 **Recovering dropped details.** Information removed from your active context is preserved in the session, including earlier thinking and tool outputs. Prefer \`context_lookup\` with a specific question: a subagent searches the transcript in its own context and returns relevant findings. If its findings are incomplete, use the bounded fallback tools \`context_list_entries\`, \`context_grep\`, and \`context_show_entry\`; follow their pagination instructions for more detail. Do not read or grep raw session JSONL files or old dumps through filesystem tools in this conversation — use these recovery tools instead.`;
 
+const EVIDENCE_BOUNDARY_RULE = "**Evidence boundary:** Tool signatures and file lists do not contain command output, file contents, or rules from read documents; if a claim depends on that removed evidence, use `context_lookup` or re-read the source before relying on it.";
+
 async function buildMechanicalSummary(opts: {
   reason: string; // pi's raw reason: "manual" | "threshold" | "overflow"
   tokensBefore: number;
@@ -657,6 +680,7 @@ async function buildMechanicalSummary(opts: {
   }
   parts.push(`- Latest: ${opts.now} (trigger: ${opts.reason}, ~${opts.tokensBefore.toLocaleString()} tokens before compaction)`);
   parts.push("- In the compacted spans, user and assistant prose is kept verbatim, subject to budget trimming; tool calls are kept as one-line signatures (arguments truncated). Assistant thinking and tool outputs are removed. Retained prose is a record of what was said, not verification of its claims.");
+  parts.push("- Tool status: ok = result not flagged as an error; error = result flagged as an error; unknown = no safely matched result/status. Output content is removed in all cases. ok does not prove a command or tests passed. Calls without a status in older spans have unknown outcomes.");
   parts.push(
     "- pi keeps the most recent part of the conversation verbatim (its `keepRecentTokens` setting). The spans below cover only what came *before* that; everything after the last span is uncompacted.",
   );
@@ -673,9 +697,11 @@ async function buildMechanicalSummary(opts: {
   const hasFileLists = opts.readFiles.length > 0 || opts.modifiedFiles.length > 0;
   if (hasFileLists) parts.push("");
   if (opts.readFiles.length > 0)
-    parts.push(`<read-files note="read before compaction; contents NOT in context">\n${opts.readFiles.join("\n")}\n</read-files>`);
+    parts.push(`<read-files note="read before compaction; content removed — re-read or use context_lookup">\n${opts.readFiles.map((file) => `${file} (content removed)`).join("\n")}\n</read-files>`);
   if (opts.modifiedFiles.length > 0)
     parts.push(`<modified-files note="modified before compaction; current contents NOT in context">\n${opts.modifiedFiles.join("\n")}\n</modified-files>`);
+  parts.push("");
+  parts.push(EVIDENCE_BOUNDARY_RULE);
   parts.push("");
   parts.push(closingLine);
 
